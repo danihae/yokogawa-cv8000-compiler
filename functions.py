@@ -40,9 +40,9 @@ def parse_measurement_data(mlf_files):
             doc = xmltodict.parse(xml_data)
             Title = doc['bts:MeasurementDetail']['@bts:Title']
             plate_match = re.search(r"Plat(t)?e(\d+)", Title)
-            plate = plate_match.group(2) if plate_match else None
+            plate = plate_match.group(2) if plate_match else 'None'
             diff_match = re.search(r"Diff(\d+)", Title)
-            diff = diff_match.group(1) if diff_match else None
+            diff = diff_match.group(1) if diff_match else 'None'
             BeginTime = pd.to_datetime(doc['bts:MeasurementDetail']['@bts:BeginTime'])
             EndTime = pd.to_datetime(doc['bts:MeasurementDetail']['@bts:EndTime'])
             filter_dict = {}
