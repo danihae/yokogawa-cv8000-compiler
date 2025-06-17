@@ -17,7 +17,7 @@ Clone this repository to your local machine:
 
 ```bash
 git clone https://github.com/yourusername/yokogawa-cv8000-compiler.git
-cd yokogawa-cv8000-compiler
+cd yokogawa_cv8000_utils
 ```
 
 Install the required dependencies using pip:
@@ -41,7 +41,7 @@ folder_export = 'D:/YourPath/compiled/'
 2. **Run the compilation script**:
 
 ```bash
-python compile.py
+python compile_legacy.py
 ```
 
 The script will:
@@ -71,7 +71,7 @@ You can modify the `compile_field` function in `functions.py` to change:
 
 Example for adjusting the number of parallel processes:
 ```python
-# In compile.py
+# In compile_legacy.py
 with Pool(4) as pool:  # Change from 2 to 4 for more parallel processes
     pool.starmap(compile_field_wrapper, args_list)
 ```

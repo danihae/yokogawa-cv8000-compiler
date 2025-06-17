@@ -1,5 +1,5 @@
 import glob
-from functions import *
+from yokogawa_cv8000_utils.functions_legacy import *
 from itertools import product
 from multiprocessing import Pool
 
