@@ -16,9 +16,13 @@ def parse_measurement_data(mlf_files):
     for mlf_file in mlf_files:
         # read MeasurementData.mlf file with single tif-file information
         with open(mlf_file) as fd:
-            doc = xmltodict.parse(fd.read())
+            doc = xmltodict.parse(fd.read(),
+                                  process_namespaces=True,
+                                  namespaces={"http://www.yokogawa.co.jp/BTS/BTSSchema/1.0": None},
+                                  attr_prefix="", cdata_key="Value"
+                                  )
         dirname = os.path.dirname(mlf_file) + '/'
-        list_record = doc['bts:MeasurementData']['bts:MeasurementRecord']
+        list_record = doc['MeasurementData']['MeasurementRecord']
         # get conditions from Wells.txt file
         infotxt = os.path.dirname(os.path.dirname(mlf_file)) + '/Wells.txt'
         if os.path.exists(infotxt):
@@ -37,40 +41,40 @@ def parse_measurement_data(mlf_files):
         mrf_file = dirname + 'MeasurementDetail.mrf'
         with open(mrf_file, encoding="utf-8-sig") as fd:
             xml_data = fd.read()
-            doc = xmltodict.parse(xml_data)
-            Title = doc['bts:MeasurementDetail']['@bts:Title']
-            plate_match = re.search(r"Plat(t)?e(\d+)", Title)
-            plate = plate_match.group(2) if plate_match else 'None'
-            diff_match = re.search(r"Diff(\d+)", Title)
-            diff = diff_match.group(1) if diff_match else 'None'
-            BeginTime = pd.to_datetime(doc['bts:MeasurementDetail']['@bts:BeginTime'])
-            EndTime = pd.to_datetime(doc['bts:MeasurementDetail']['@bts:EndTime'])
+            doc = xmltodict.parse(xml_data,
+                                  process_namespaces = True,
+                                  namespaces = {"http://www.yokogawa.co.jp/BTS/BTSSchema/1.0": None},
+                                  attr_prefix = "", cdata_key = "Value"
+                                  )
+            Title = doc['MeasurementDetail']['Title']
+            BeginTime = pd.to_datetime(doc['MeasurementDetail']['BeginTime'])
+            EndTime = pd.to_datetime(doc['MeasurementDetail']['EndTime'])
             filter_dict = {}
             pixelsize_dict = {}
-            if isinstance(doc['bts:MeasurementDetail']['bts:MeasurementChannel'], list):
-                for channel_info in doc['bts:MeasurementDetail']['bts:MeasurementChannel']:
-                    channel = int(channel_info['@bts:Ch'])
-                    filter_pos = int(channel_info['@bts:FilterWheelPosition'])
+            if isinstance(doc['MeasurementDetail']['MeasurementChannel'], list):
+                for channel_info in doc['MeasurementDetail']['MeasurementChannel']:
+                    channel = int(channel_info['Ch'])
+                    filter_pos = int(channel_info['FilterWheelPosition'])
                     filter_dict[channel] = filter_pos
-                    pixelsize_dict[channel] = float(channel_info['@bts:HorizontalPixelDimension'])
+                    pixelsize_dict[channel] = float(channel_info['HorizontalPixelDimension'])
             else:
-                channel = int(doc['bts:MeasurementDetail']['bts:MeasurementChannel']['@bts:Ch'])
-                filter_pos = int(doc['bts:MeasurementDetail']['bts:MeasurementChannel']['@bts:FilterWheelPosition'])
+                channel = int(doc['MeasurementDetail']['MeasurementChannel']['Ch'])
+                filter_pos = int(doc['MeasurementDetail']['MeasurementChannel']['FilterWheelPosition'])
                 filter_dict[channel] = filter_pos
-                pixelsize_dict[channel] = float(doc['bts:MeasurementDetail']['bts:MeasurementChannel']['@bts:HorizontalPixelDimension'])
+                pixelsize_dict[channel] = float(doc['MeasurementDetail']['MeasurementChannel']['HorizontalPixelDimension'])
         for dict_ in list_record:
-            type_ = dict_['@bts:Type']
+            type_ = dict_['Type']
             if type_ != 'ERR':
-                timestamp = pd.to_datetime(dict_['@bts:Time'])
-                column = int(dict_['@bts:Column'])
-                row = int(dict_['@bts:Row'])
-                timepoint = int(dict_['@bts:TimePoint'])
-                field = int(dict_['@bts:FieldIndex'])
-                z_idx = int(dict_['@bts:ZIndex'])
-                timeline_idx = int(dict_['@bts:TimelineIndex'])
-                action_idx = int(dict_['@bts:ActionIndex'])
-                action = dict_['@bts:Action']
-                channel = int(dict_['@bts:Ch'])
+                timestamp = pd.to_datetime(dict_['Time'])
+                column = int(dict_['Column'])
+                row = int(dict_['Row'])
+                timepoint = int(dict_['TimePoint'])
+                field = int(dict_['FieldIndex'])
+                z_idx = int(dict_['ZIndex'])
+                timeline_idx = int(dict_['TimelineIndex'])
+                action_idx = int(dict_['ActionIndex'])
+                action = dict_['Action']
+                channel = int(dict_['Ch'])
                 color = filter_dict[channel]
                 pixelsize = pixelsize_dict[channel]
                 basename = dict_['#text']
@@ -82,7 +86,7 @@ def parse_measurement_data(mlf_files):
                 else:
                     fixed = False
                 condition = data_dict[well.replace('0', '')] if well.replace('0', '') in data_dict.keys() else None
-                meta_imgs.append([filename, Title, plate, diff, condition, timestamp, BeginTime, EndTime, column, row,
+                meta_imgs.append([filename, Title, condition, timestamp, BeginTime, EndTime, column, row,
                                   well, timepoint, field, z_idx, timeline_idx, action_idx, action, channel, color,
                                   fixed, pixelsize])
 
@@ -163,7 +167,7 @@ def compile_field(df_imgs, plate, well, field, folder_export, proj_mode='map'):
     - well (str): Well identifier
     - field (int): Field number
     - folder_export (str): Folder path to export the compiled data
-    - proj_mode (str, optional): Projection mode ('mip' or 'map'). Default is 'map'.
+    - proj_mode (str, optional): Projection mode ('mip' or 'maxz'). Default is 'map'.
 
     Returns:
     None
@@ -174,50 +178,50 @@ def compile_field(df_imgs, plate, well, field, folder_export, proj_mode='map'):
     Load metadata by df_meta = pd.read_csv(csv_file, parse_dates=['timestamps'], index_col=0)
     """
     df_i = filter_df(df_imgs, plate=plate, well=well, field=field)
-    channels_i = df_i['channel'].unique()
+    actions = df_i['action'].unique()
     begin_timestamps_i = np.sort(df_i['begin'].unique())
-    for channel_ij in channels_i:  # fluorescent channels
-        df_ij = filter_df(df_i, channel=channel_ij)
-        color_ij = df_ij.color.unique()[0]
-        name_ij = f'plate{plate}_well{well}_field{field}_channel{channel_ij}_color_{color_ij}'
-        if len(df_ij) > 0:
-            data_ij = []
-            conditions_ij = []
-            timestamps_ij = []
-            for begin in begin_timestamps_i:  # begin timepoints of measurements
-                df_ijk = filter_df(df_ij, begin=begin)
-                timepoints_ijk = np.sort(df_ijk['timepoint'].unique())
-                for tp in timepoints_ijk:  # timepoints per measurement
-                    data_ijk = []
-                    timestamps_ijk = []
-                    conditions_ijk = []
-                    slices_ijk = df_ijk['z_idx'].unique()
-                    for z in slices_ijk:
-                        df_ijkl = filter_df(df_ijk, timepoint=tp, z_idx=z)
-                        if len(df_ijkl) != 1:
-                            raise ValueError(f'Compiling of data failed. Len={len(df_ijkl)}.')
-                        file_ijkl = df_ijkl['filename'].values[0]
-                        data_ijkl = tifffile.imread(file_ijkl)
-                        data_ijk.append(data_ijkl)
-                        timestamps_ijk.append(df_ijkl['timestamp'])
-                        conditions_ijk.append(df_ijkl['condition'])
-                    timestamps_ij.append(np.min(timestamps_ijk))
-                    conditions_ij.append(np.unique(conditions_ijk)[0])
-                    data_ijk = np.asarray(data_ijk)
-                    if proj_mode == 'mip':
-                        data_ij.append(np.max(data_ijk, axis=0))
-                    elif proj_mode == 'map':
-                        data_ij.append(data_ijk[np.argmax(np.mean(data_ijk, axis=(1, 2)))])
-            data_ij = np.asarray(data_ij)
-            pixelsize = df_ij['pixelsize'][0]
-            # save tif
-            tifffile.imwrite(folder_export + name_ij + '.tif', data_ij, imagej=True,
-                             resolution=(1 / pixelsize, 1 / pixelsize),
-                             metadata={'unit': 'um', 'axes': 'ZYX', 'timestamps': timestamps_ij,
-                                       'conditions': conditions_ij})
-            # save metadata
-            df_meta_ij = pd.DataFrame({'timestamp': timestamps_ij, 'condition': conditions_ij})
-            df_meta_ij.to_csv(folder_export + name_ij + '.csv')
+    for action in actions:  # actions (e.g. "2D" or "3D")
+        df_i = filter_df(df_i, action=action)
+        channels_i = df_i['channel'].unique()
+        for channel_ij in channels_i:  # fluorescent channels
+            df_ij = filter_df(df_i, channel=channel_ij, action=action)
+            color_ij = df_ij.color.unique()[0]
+            name_ij = f'plate{plate}_well{well}_field{field}_channel{channel_ij}_color{color_ij}_action{action}'
+            if len(df_ij) > 0:
+                data_ij = []
+                conditions_ij = []
+                timestamps_ij = []
+                for begin in begin_timestamps_i:  # begin timepoints of measurements
+                    df_ijk = filter_df(df_ij, begin=begin)
+                    timepoints_ijk = np.sort(df_ijk['timepoint'].unique())
+                    for tp in timepoints_ijk:  # timepoints per measurement
+                        data_ijk = []
+                        timestamps_ijk = []
+                        conditions_ijk = []
+                        slices_ijk = df_ijk['z_idx'].unique()
+                        for z in slices_ijk:
+                            df_ijkl = filter_df(df_ijk, timepoint=tp, z_idx=z)
+                            if len(df_ijkl) != 1:
+                                raise ValueError(f'Compiling of data failed. Len={len(df_ijkl)}.')
+                            file_ijkl = df_ijkl['filename'].values[0]
+                            data_ijkl = tifffile.imread(file_ijkl)
+                            data_ijk.append(data_ijkl)
+                            timestamps_ijk.append(df_ijkl['timestamp'])
+                            conditions_ijk.append(df_ijkl['condition'])
+                        timestamps_ij.append(np.min(timestamps_ijk))
+                        conditions_ij.append(np.unique(conditions_ijk)[0])
+                        data_ijk = np.asarray(data_ijk)
+                        if proj_mode == 'mip':
+                            data_ij.append(np.max(data_ijk, axis=0))
+                        elif proj_mode == 'maxz':
+                            data_ij.append(data_ijk[np.argmax(np.mean(data_ijk, axis=(1, 2)))])
+                data_ij = np.asarray(data_ij)
+                pixelsize = df_ij['pixelsize'][0]
+                # save tif
+                tifffile.imwrite(folder_export + name_ij + '.tif', data_ij, imagej=True,
+                                 resolution=(1 / pixelsize, 1 / pixelsize),
+                                 metadata={'unit': 'um', 'axes': 'ZYX', 'timestamps': timestamps_ij,
+                                           'conditions': conditions_ij})
 
 
 def get_well_name(well):
@@ -225,4 +229,3 @@ def get_well_name(well):
     number = str(col)
     letter = string.ascii_uppercase[int(row) - 1]
     return letter + number
-

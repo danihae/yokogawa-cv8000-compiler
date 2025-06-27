@@ -41,7 +41,7 @@ folder_export = 'D:/YourPath/compiled/'
 2. **Run the compilation script**:
 
 ```bash
-python compile.py
+python __main__.py
 ```
 
 The script will:
@@ -71,7 +71,7 @@ You can modify the `compile_field` function in `functions.py` to change:
 
 Example for adjusting the number of parallel processes:
 ```python
-# In compile.py
+# In __main__.py
 with Pool(4) as pool:  # Change from 2 to 4 for more parallel processes
     pool.starmap(compile_field_wrapper, args_list)
 ```
