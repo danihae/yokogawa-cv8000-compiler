@@ -7,7 +7,7 @@ name = "yokogawa-cv8000-compiler"
 version = "0.1.0"
 description = "Process output data from Yokogawa Cell Voyager CV8000"
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.9"
 license = {text = "MIT"}
 dependencies = [
     "numpy",
@@ -17,7 +17,11 @@ dependencies = [
 ]
 
 [project.scripts]
-compile-cv8000 = "yokogawa_compiler.compile:main"
+compile-cv8000 = "yokogawa_cv8000_compiler.__main__:main"
+compress-tiffs = "yokogawa_cv8000_compiler.tiff_compression:main"
+
+[project.optional-dependencies]
+dev = ["pytest"]
 
 [tool.setuptools.packages.find]
 where = ["."]
