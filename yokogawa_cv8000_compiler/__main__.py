@@ -1,31 +1,64 @@
+import argparse
 import glob
-from functions import *
-from itertools import product
+import os
 from multiprocessing import Pool
 
-# data folder with raw tif files
-folder_data = 'X:/path/of/directory/'
-
-# get measurement files (adjust if less subdirectories)
-mlf_files = glob.glob(folder_data + '*/*/*/MeasurementData.mlf')
-
-# folder to save compiled data
-folder_export = 'D:/path/output/'
-os.makedirs(folder_export, exist_ok=True)
+from .compiling import compile_field
+from .parsing import parse_measurement_data
 
 
-# wrapper
-def compile_field_wrapper(plate, well, field, df_imgs, folder_export):
-    compile_field(df_imgs, plate=plate, well=well, field=field, folder_export=folder_export)
+def compile_field_wrapper(args):
+    """Wrapper for compile_field to use with multiprocessing.Pool.
 
-n_pools = 4
+    Accepts a tuple of (plate, well, field, df_subset, folder_export, proj_mode)
+    where df_subset is already filtered to the relevant (plate, well, field).
+    """
+    plate, well, field, df_subset, folder_export, proj_mode = args
+    compile_field(df_subset, plate=plate, well=well, field=field,
+                  folder_export=folder_export, proj_mode=proj_mode)
 
-if __name__ == '__main__':
-    # parse measurement files and create data frame
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compile Yokogawa CV8000 image data into TIFF stacks."
+    )
+    parser.add_argument("data_folder",
+                        help="Path to folder containing raw Yokogawa CV8000 data")
+    parser.add_argument("export_folder",
+                        help="Path to folder for compiled output")
+    parser.add_argument("--depth", type=int, default=3,
+                        help="Subdirectory depth to search for MeasurementData.mlf (default: 3)")
+    parser.add_argument("--processes", "-p", type=int, default=4,
+                        help="Number of parallel processes (default: 4)")
+    parser.add_argument("--proj-mode", choices=["mip", "map"], default="map",
+                        help="Projection mode: 'mip' (max intensity) or 'map' (max average) (default: map)")
+    args = parser.parse_args()
+
+    # Build glob pattern based on depth
+    wildcard = "/".join(["*"] * args.depth)
+    mlf_files = glob.glob(os.path.join(args.data_folder, wildcard, "MeasurementData.mlf"))
+
+    if not mlf_files:
+        print(f"No MeasurementData.mlf files found in {args.data_folder}")
+        return
+
+    os.makedirs(args.export_folder, exist_ok=True)
+
+    # Parse measurement files and create data frame
     df_imgs, plates, wells, fields = parse_measurement_data(mlf_files)
 
-    # Create a list of tuples containing the arguments for each iteration
-    args_list = [(plate, well, field, df_imgs, folder_export) for plate, well, field in product(plates, wells, fields)]
+    # Build task list from actual data groups (skip empty combinations)
+    # Each worker receives only the subset it needs, reducing serialization cost
+    args_list = []
+    for (plate, well, field), df_group in df_imgs.groupby(['plate', 'well', 'field']):
+        args_list.append((plate, well, field, df_group, args.export_folder, args.proj_mode))
 
-    with Pool(n_pools) as pool:  # specify number of processes
-        pool.starmap(compile_field_wrapper, args_list)
+    print(f"Processing {len(args_list)} (plate, well, field) combinations "
+          f"with {args.processes} processes...")
+
+    with Pool(args.processes) as pool:
+        pool.map(compile_field_wrapper, args_list)
+
+
+if __name__ == "__main__":
+    main()
