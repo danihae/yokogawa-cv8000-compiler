@@ -1,8 +1,13 @@
-# Yokogawa CV8000 Data Compiler
+# Yokogawa Microscopy Utilities
 
-A Python tool for processing output data from Yokogawa Cell Voyager CV8000 high-content screening systems. This tool reads the metadata files, compiles the data, and builds image stacks for each Field of View (FoV). This makes downstream data processing easier and eliminates the need for the proprietary Yokogawa CellProfiler tool.
+A set of tools for the UMG Pharmacology microscopy workflow:
 
-## Features
+1. **CV8000 Data Compiler** — CLI tool that reads Yokogawa CV8000 output, compiles multi-channel / multi-timepoint / multi-Z data into TIFF stacks, and applies z-projections
+2. **Microscopy Experiment Manager** — Gradio web app for registering experiments, creating metadata-tagged folders on the NAS, and managing multi-day acquisitions
+
+## CV8000 Data Compiler
+
+### Features
 
 - Parses Yokogawa CV8000 MeasurementData.mlf files to extract metadata
 - Reads associated MeasurementDetail.mrf files for additional metadata
@@ -11,24 +16,17 @@ A Python tool for processing output data from Yokogawa Cell Voyager CV8000 high-
 - Preserves important metadata (timestamps, conditions, pixel size, etc.)
 - Supports parallel processing for faster compilation
 
-## Installation
+### Installation
 
-Clone this repository to your local machine:
+Clone this repository and install:
 
 ```bash
 git clone https://github.com/danihae/yokogawa-cv8000-compiler.git
 cd yokogawa-cv8000-compiler
-```
-
-Install the package using pip:
-
-```bash
 pip install -e .
 ```
 
-## Usage
-
-Run the compiler from the command line:
+### Usage
 
 ```bash
 compile-cv8000 /path/to/data /path/to/output
@@ -73,13 +71,6 @@ compile-cv8000 /data/experiment1 /output/compiled --proj-mode mes
 compile-cv8000 /data/experiment1 /output/compiled --depth 2
 ```
 
-The script will:
-
-- Find all MeasurementData.mlf files in the specified directory
-- Extract metadata from these files and associated MeasurementDetail.mrf files
-- Process each field in each well of each plate
-- Save compiled TIFF stacks to the export folder
-
 ### Output
 
 The compiled data is saved as TIFF stacks (.tif) with ImageJ-compatible metadata (pixel size, axes).
@@ -90,17 +81,75 @@ Each file is named using this pattern:
 plate{plate}_well{well}_field{field}_channel{channel}_color{color}_action{action}.tif
 ```
 
+## Microscopy Experiment Manager (Web GUI)
+
+A Gradio web app for registering new microscopy experiments. Researchers fill in metadata before acquisition; the app creates a deterministic hash-named folder on the NAS and returns the path to paste into the microscopy software.
+
+### Key capabilities
+
+- **New Experiment** tab — fill in metadata, create a folder, get a copyable path
+- **Continue Experiment** tab — browse and resume previous experiments (sorted by date, with full metadata display)
+- **Multi-day measurements** — mark experiments that span multiple acquisition sessions
+- **Filesystem-based storage** — each experiment is a self-contained folder with its own `metadata.json` (no central database to corrupt)
+- **Deterministic folder names** — identical metadata on the same day always produces the same folder
+
+### Quick start (Docker)
+
+1. Copy the environment template and edit it:
+
+   ```bash
+   cp .env.example .env
+   # Edit .env — set UPLOAD_ROOT to the NAS upload path
+   ```
+
+2. Build and start the services:
+
+   ```bash
+   docker compose up -d
+   ```
+
+The web GUI is available at `http://<host>:80` (via nginx) or directly at `http://<host>:7860`.
+
+### Configuration (.env)
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `UPLOAD_ROOT` | Path where experiment folders are created | `/volume1/upload` |
+| `UPLOAD_ROOT_DISPLAY` | Path shown to the user (only needed in Docker, when different from `UPLOAD_ROOT`) | same as `UPLOAD_ROOT` |
+| `GRADIO_PORT` | Port for the Gradio server | `7860` |
+
+### How it works
+
+1. Researcher opens the web GUI on the acquisition computer
+2. Fills in required metadata (user, project, instrument, modality, cell type, well type)
+3. Clicks "Create Experiment Folder"
+4. App creates a hash-named folder on the NAS with a `metadata.json` inside
+5. Folder is made writable so the microscopy software can save data
+6. Researcher copies the returned path into the microscopy software
+7. For multi-day experiments, the "Continue Experiment" tab lists all previous experiments for easy resumption
+
 ## Code Structure
 
-- **`__main__.py`**: CLI entry point that orchestrates the compilation process
-- **`functions.py`**: Contains all utility functions for parsing and processing data
+- **`yokogawa_cv8000_compiler/`** — CLI tool for compiling CV8000 image data
+  - `__main__.py` — CLI entry point
+  - `compiling.py` — projection and compilation logic
+  - `parsing.py` — metadata file parsing
+  - `utils.py` — helper functions
+- **`web/`** — Gradio web app for experiment registration
+  - `app.py` — Gradio application
+  - `Dockerfile` — container image
+  - `nginx.conf` — reverse proxy config
+- **`docker-compose.yml`** — orchestrates Gradio + nginx services
 
 ## Dependencies
 
-- numpy: For numerical operations
-- pandas: For data manipulation and management
-- tifffile: For reading and writing TIFF files
-- xmltodict: For parsing XML metadata files
+### CLI tool
+
+- numpy, pandas, tifffile, xmltodict
+
+### Web GUI
+
+- gradio, python-dotenv
 
 ## License
 
@@ -109,3 +158,4 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## TODO
 
 - [ ] Add a small real CV8000 measurement dataset (minimal plate, single well/field) to `tests/data/` for integration testing
+- [ ] Add support for additional microscopy softwares (Yokogawa CQ1)
