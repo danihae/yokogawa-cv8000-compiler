@@ -82,3 +82,6 @@ logs/
 docs/_build/
 docs/site/
 site/
+
+# OS
+Thumbs.db
