@@ -4,6 +4,14 @@ import numpy as np
 import tifffile
 
 
+def _entropy(image):
+    """Shannon entropy of a 2D image based on its intensity histogram."""
+    counts, _ = np.histogram(image.ravel(), bins=256)
+    probs = counts / counts.sum()
+    probs = probs[probs > 0]
+    return -np.sum(probs * np.log2(probs))
+
+
 def compile_field(df_imgs, plate, well, field, folder_export, proj_mode='map'):
     """Compile data for a specific plate, well, and field from a DataFrame of images.
 
@@ -16,6 +24,7 @@ def compile_field(df_imgs, plate, well, field, folder_export, proj_mode='map'):
         proj_mode (str, optional): Projection mode. Default is 'map'.
             - 'mip': Maximum Intensity Projection (max across z-slices).
             - 'map': Maximum Average Projection (z-slice with highest mean intensity).
+            - 'mes': Maximum Entropy Slice (z-slice with highest Shannon entropy).
 
     Returns:
         None
@@ -23,8 +32,8 @@ def compile_field(df_imgs, plate, well, field, folder_export, proj_mode='map'):
     Raises:
         ValueError: If compiling of data fails or proj_mode is invalid.
     """
-    if proj_mode not in ('mip', 'map'):
-        raise ValueError(f"Unknown proj_mode '{proj_mode}'. Use 'mip' or 'map'.")
+    if proj_mode not in ('mip', 'map', 'mes'):
+        raise ValueError(f"Unknown proj_mode '{proj_mode}'. Use 'mip', 'map', or 'mes'.")
 
     df_i = df_imgs[(df_imgs['plate'] == plate)
                    & (df_imgs['well'] == well)
@@ -51,8 +60,10 @@ def compile_field(df_imgs, plate, well, field, folder_export, proj_mode='map'):
 
             if proj_mode == 'mip':
                 data_ij.append(np.max(data_ijk, axis=0))
-            else:  # 'map'
+            elif proj_mode == 'map':
                 data_ij.append(data_ijk[np.argmax(np.mean(data_ijk, axis=(1, 2)))])
+            else:  # 'mes'
+                data_ij.append(data_ijk[np.argmax([_entropy(s) for s in data_ijk])])
 
         if not data_ij:
             continue

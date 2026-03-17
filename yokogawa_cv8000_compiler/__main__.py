@@ -30,8 +30,9 @@ def main():
                         help="Subdirectory depth to search for MeasurementData.mlf (default: 3)")
     parser.add_argument("--processes", "-p", type=int, default=4,
                         help="Number of parallel processes (default: 4)")
-    parser.add_argument("--proj-mode", choices=["mip", "map"], default="map",
-                        help="Projection mode: 'mip' (max intensity) or 'map' (max average) (default: map)")
+    parser.add_argument("--proj-mode", choices=["mip", "map", "mes"], default="map",
+                        help="Projection mode: 'mip' (max intensity projection), 'map' (max average slice), "
+                             "or 'mes' (max entropy slice) (default: map)")
     args = parser.parse_args()
 
     # Build glob pattern based on depth

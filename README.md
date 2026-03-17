@@ -7,7 +7,7 @@ A Python tool for processing output data from Yokogawa Cell Voyager CV8000 high-
 - Parses Yokogawa CV8000 MeasurementData.mlf files to extract metadata
 - Reads associated MeasurementDetail.mrf files for additional metadata
 - Compiles multi-channel, multi-timepoint, and multi-Z data into organized image stacks
-- Creates maximum intensity projections (MIP) or maximum average projections (MAP)
+- Creates maximum intensity projections (MIP), maximum average projections (MAP), or maximum entropy slice projections (MES)
 - Preserves important metadata (timestamps, conditions, pixel size, etc.)
 - Supports parallel processing for faster compilation
 
@@ -50,7 +50,11 @@ positional arguments:
 optional arguments:
   --depth DEPTH         Subdirectory depth to search for MeasurementData.mlf (default: 3)
   -p, --processes N     Number of parallel processes (default: 4)
-  --proj-mode {mip,map} Projection mode: 'mip' (max intensity) or 'map' (max average) (default: map)
+  --proj-mode {mip,map,mes}
+                        Projection mode (default: map):
+                          mip  Maximum Intensity Projection — pixel-wise max across all z-slices
+                          map  Maximum Average slice — z-slice with the highest mean intensity
+                          mes  Maximum Entropy Slice — z-slice with the highest Shannon entropy (useful for focus-based selection)
 ```
 
 ### Examples
@@ -61,6 +65,9 @@ compile-cv8000 /data/experiment1 /output/compiled
 
 # Use 8 parallel processes with maximum intensity projection
 compile-cv8000 /data/experiment1 /output/compiled -p 8 --proj-mode mip
+
+# Use maximum entropy slice selection (good for in-focus plane detection)
+compile-cv8000 /data/experiment1 /output/compiled --proj-mode mes
 
 # Search only 2 subdirectory levels deep
 compile-cv8000 /data/experiment1 /output/compiled --depth 2

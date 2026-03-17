@@ -178,6 +178,27 @@ class TestCompileField:
             # Every projected frame should be the bright slice (all 1000s)
             assert (data == 1000).all()
 
+    def test_mes_projection(self, sample_df, tmp_path):
+        """MES should pick the z-slice with highest Shannon entropy."""
+        rng = np.random.default_rng(0)
+
+        def mock_imread(path):
+            if "_z2_" in path:
+                # High entropy: uniform random values across full range
+                return rng.integers(0, 65535, (64, 64), dtype=np.uint16)
+            # Low entropy: constant image
+            return np.full((64, 64), 500, dtype=np.uint16)
+
+        with patch("yokogawa_cv8000_compiler.compiling.tifffile.imread", side_effect=mock_imread):
+            with patch("yokogawa_cv8000_compiler.compiling.tifffile.imwrite") as mock_write:
+                compile_field(sample_df, "Exp1", "W01", 1, str(tmp_path), proj_mode="mes")
+
+        assert mock_write.call_count == 2
+        for call in mock_write.call_args_list:
+            data = call[0][1]
+            # Every projected frame should be the high-entropy slice (not constant 500)
+            assert not (data == 500).all()
+
     def test_output_filename_pattern(self, sample_df, tmp_path):
         """Output filenames should contain plate, well, field, channel, color, action."""
         def mock_imread(path):
