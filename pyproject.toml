@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.scripts]
-compile-cv8000 = "yokogawa_cv8000_utils.cli:app"
+compile-cv8000 = "compiler.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]

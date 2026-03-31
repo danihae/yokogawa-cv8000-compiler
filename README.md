@@ -113,9 +113,9 @@ The package can also be used programmatically:
 
 ```python
 from pathlib import Path
-from yokogawa_cv8000_utils.discovery import find_measurements
-from yokogawa_cv8000_utils.processing import parse_measurements
-from yokogawa_cv8000_utils.export import process_fieldstacks_parallel
+from compiler.discovery import find_measurements
+from compiler.processing import parse_measurements
+from compiler.export import process_fieldstacks_parallel
 
 root_dir = Path("/path/to/data")
 out_dir = Path("/path/to/output")
@@ -152,6 +152,61 @@ process_fieldstacks_parallel(
 - `typer` — CLI interface
 - `xarray` — labelled N-dimensional arrays
 - `xmltodict` — XML metadata parsing
+
+## TIFF Compression Utility
+
+A CLI tool and Python API for batch-compressing TIFF files. Accepts any mix of `.zip` archives, directories (scanned recursively), and individual `.tif`/`.tiff` files. Non-TIFF files are copied through unchanged.
+
+Recompresses TIFFs with `zlib`, `lzw`, `lzma`, or `zstd` codecs while preserving ImageJ metadata, resolution tags, and photometric interpretation. Each output file is verified after compression. Uses `ProcessPoolExecutor` for true parallelism (bypasses the GIL).
+
+### CLI usage
+
+```bash
+python -m tiff_utils.tiff_compression [OPTIONS] INPUTS...
+```
+
+```text
+positional arguments:
+  inputs                Zip files, directories, or individual files to process
+
+options:
+  -o, --output-dir DIR  Output directory (default: ./compressed_tiffs)
+  -c, --compression     Codec: zlib | lzw | lzma | zstd (default: zlib)
+  -j, --workers N       Parallel worker processes (default: 4)
+  -Z, --max-parallel-zips N
+                        Zip files to process concurrently (default: 1)
+  --delete              Delete original zip files after successful verification
+  --dry-run             Preview mode — process without deleting originals
+```
+
+### Compression examples
+
+```bash
+# Compress all TIFFs in a zip archive
+python -m tiff_utils.tiff_compression data.zip -o compressed/
+
+# Compress a whole directory with zstd, 8 workers
+python -m tiff_utils.tiff_compression /data/experiment1 -c zstd -j 8 -o compressed/
+
+# Mix of zips and loose files, delete originals after success
+python -m tiff_utils.tiff_compression plate1.zip plate2.zip extra.tif --delete -o compressed/
+```
+
+### Python API (compression)
+
+```python
+from pathlib import Path
+from tiff_utils.tiff_compression import compress_tiffs
+
+summary = compress_tiffs(
+    inputs=[Path("data.zip"), Path("/data/loose_tiffs/")],
+    output_dir=Path("compressed"),
+    compression="zstd",
+    workers=8,
+    delete_originals=False,
+)
+# summary: {"processed": N, "succeeded": N, "failed": N, "deleted": N}
+```
 
 ## Microscopy Experiment Manager (Web GUI)
 
@@ -202,12 +257,15 @@ The web GUI is available at `http://<host>:80` (via nginx) or directly at `http:
 
 ## Code Structure
 
-- **`yokogawa_cv8000_compiler/`** — CLI tool for compiling CV8000 image data
-  - `__main__.py` — CLI entry point
-  - `compiling.py` — projection and compilation logic
-  - `parsing.py` — metadata file parsing
-  - `utils.py` — helper functions
-- **`web/`** — Gradio web app for experiment registration
+- **`src/compiler/`** — CLI tool for compiling CV8000 image data
+  - `cli.py` — CLI entry point (Typer)
+  - `discovery.py` — recursive `.wpi` file discovery
+  - `metadata.py` — Pydantic models for Yokogawa XML metadata
+  - `processing.py` — XML parsing and DataFrame merging
+  - `export.py` — OME-TIFF writing, corrections, and Z-projection
+- **`src/tiff_utils/`** — batch TIFF compression utility
+  - `tiff_compression.py` — compress TIFFs from zips, directories, or loose files
+- **`experiment_manager/`** — Gradio web app for experiment registration
   - `app.py` — Gradio application
   - `Dockerfile` — container image
   - `nginx.conf` — reverse proxy config

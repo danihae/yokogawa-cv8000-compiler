@@ -85,3 +85,6 @@ site/
 
 # OS
 Thumbs.db
+
+# Internal
+docs_internal/
