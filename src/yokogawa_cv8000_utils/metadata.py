@@ -1,4 +1,4 @@
-# Adapted from 
+# Adapted from
 
 from pathlib import Path
 from typing import Annotated, Literal, Optional, Any
@@ -6,7 +6,7 @@ from typing import Annotated, Literal, Optional, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_pascal
 
-from yokogawa_cv8000_utils.discovery import path_exists
+from .discovery import path_exists
 
 
 class Base(BaseModel):
@@ -45,7 +45,7 @@ class ImageMeasurementRecord(MeasurementRecordBase):
 
 
 class ErrorMeasurementRecord(MeasurementRecordBase):
-    type: Literal["IMG","ERR"]
+    type: Literal["ERR"]
 
 
 class MeasurementData(Base):
@@ -351,15 +351,11 @@ class CellVoyagerAcquisition(Base):
     @classmethod
     def validate_parent(cls, v):
         if not path_exists(v):
-            print(v)
-            raise ValueError("Provided path does not exist (real or zip-internal).")
+            raise ValueError(f"Provided path does not exist: {v}")
         return v
-
-    def _no_measurement_records(self):
-        ValueError("No measurement records found in dataset.")
 
     def get_image_measurement_records(self) -> list[ImageMeasurementRecord]:
         if self.measurement_data.measurement_record:
             return [record for record in self.measurement_data.measurement_record if
                     isinstance(record, ImageMeasurementRecord)]
-        raise (self._no_measurement_records())
+        raise ValueError("No measurement records found in dataset.")

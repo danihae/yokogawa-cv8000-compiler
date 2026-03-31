@@ -12,8 +12,8 @@ import tifffile
 import xarray as xr
 from tqdm import tqdm
 
-from metadata import CellVoyagerAcquisition
-from yokogawa_cv8000_utils.discovery import logger
+from .metadata import CellVoyagerAcquisition
+from .discovery import logger
 
 
 def _get_well_id(row: int, column: int) -> str:
@@ -78,8 +78,7 @@ def _read_tif(path: Union[str, Path]):
     ndarray
         NumPy array containing the image data.
     """
-    path_str = str(path).replace('\\', '/')
-    return tifffile.imread(path_str)
+    return tifffile.imread(str(Path(path)))
 
 def osbm_projection(arr: xr.DataArray) -> xr.DataArray:
     """
@@ -145,7 +144,6 @@ def _entropy_projection(arr: xr.DataArray, mode: str) -> xr.DataArray:
             else: # mode == 'min'
                 best_z = np.argmin(entropies)
 
-            # **BUG FIX**: Use the calculated `best_z`, not the loop variable `z`
             projected_data[t, c] = arr.isel(T=t, C=c, Z=best_z).values
 
     # Construct and return a new xarray.DataArray with the correct dimensions and coordinates
@@ -167,6 +165,15 @@ def min_entropy_projection(arr: xr.DataArray) -> xr.DataArray:
     Performs a Minimum Entropy Projection. Returns an xarray.DataArray.
     """
     return _entropy_projection(arr, mode='min')
+
+
+def _make_correction_func(dark: np.ndarray, gain: np.ndarray):
+    """Create an image correction function with bound dark/gain arrays."""
+    def _correct(img_u16):
+        img = img_u16.astype(np.float32)
+        img_corr = (img - dark) * gain
+        return np.clip(img_corr, 0, 65535).astype(np.uint16)
+    return _correct
 
 
 def write_fieldstack(
@@ -301,12 +308,9 @@ def write_fieldstack(
                     gain = np.mean(ff) / ff
                     gain[np.isinf(gain)] = 0
 
-                    def _correct_img(img_u16):
-                        img = img_u16.astype(np.float32)
-                        img_corr = (img - dark) * gain
-                        return np.clip(img_corr, 0, 65535).astype(np.uint16)
+                    _correct_img = _make_correction_func(dark, gain)
                 else:
-                    _correct_img = lambda img: img
+                    _correct_img = None
 
                 c_data = []
                 for z, z_index in enumerate(z_indices):
@@ -374,9 +378,9 @@ def write_fieldstack(
         acquisition_metadata = acquisition_metadata[acquisition_indices[0]]
 
     channel_list = acquisition_metadata.measurement_setting.channel_list.channel
-    pixel_sizes_y = [ch.horizontal_pixel_dimension for ch in
+    pixel_sizes_x = [ch.horizontal_pixel_dimension for ch in
                      acquisition_metadata.measurement_detail.measurement_channel]
-    pixel_sizes_x = [ch.vertical_pixel_dimension for ch in acquisition_metadata.measurement_detail.measurement_channel]
+    pixel_sizes_y = [ch.vertical_pixel_dimension for ch in acquisition_metadata.measurement_detail.measurement_channel]
 
     if len(set(pixel_sizes_y)) > 1 or len(set(pixel_sizes_x)) > 1:
         raise ValueError("Pixel sizes differ between channels and cannot be reconciled.")

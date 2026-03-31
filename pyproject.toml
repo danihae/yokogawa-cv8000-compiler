@@ -3,24 +3,29 @@ requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "yokogawa-cv8000-compiler"
-version = "0.1.0"
+name = "yokogawa-cv8000-utils"
+version = "0.2.0"
 description = "Process output data from Yokogawa Cell Voyager CV8000"
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = [
+    "dask",
     "numpy",
     "pandas",
+    "pydantic>=2",
     "tifffile",
-    "xmltodict"
+    "tqdm",
+    "typer",
+    "xarray",
+    "xmltodict",
 ]
 
 [project.scripts]
-compile-cv8000 = "yokogawa_compiler.compile:main"
+compile-cv8000 = "yokogawa_cv8000_utils.cli:app"
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]
 
 [tool.black]
 line-length = 88

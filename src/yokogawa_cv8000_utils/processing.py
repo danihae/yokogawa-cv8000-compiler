@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import logging
 import re
-import sys
 from pathlib import Path
 from typing import Iterable, Tuple, List, Sequence, Union
 from typing import Optional, Any
@@ -11,8 +9,8 @@ import numpy as np
 import pandas as pd
 import xmltodict
 
-from cellvoyager_types import CellVoyagerAcquisition
-from yokogawa_cv8000_utils.discovery import path_exists, logger
+from .metadata import CellVoyagerAcquisition
+from .discovery import path_exists, logger
 
 
 def read_and_parse_xml(

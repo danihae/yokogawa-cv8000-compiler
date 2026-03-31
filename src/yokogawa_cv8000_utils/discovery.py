@@ -1,14 +1,6 @@
-import sys
+import logging
 from pathlib import Path
 from typing import Iterator, Union
-import logging
-
-# Configure logger to output to sys.stdout (notebook cell output)
-logging.basicConfig(
-    level=logging.INFO,  # or INFO, WARNING, ERROR, CRITICAL
-    stream=sys.stdout,    # this ensures output goes to notebook cell
-    format='%(levelname)s:%(message)s'
-)
 
 logger = logging.getLogger(__name__)
 
@@ -67,5 +59,4 @@ def path_exists(path: Union[Path, str]) -> bool:
     bool
         True if the path exists, False otherwise.
     """
-    path_str = str(path)
-    return Path(path_str).exists()
+    return Path(str(path)).exists()

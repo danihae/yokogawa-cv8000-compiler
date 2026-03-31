@@ -2,9 +2,9 @@ import typer
 from pathlib import Path
 import os
 
-from discovery import find_measurements
-from processing import parse_measurements
-from export import process_fieldstacks_parallel
+from .discovery import find_measurements
+from .processing import parse_measurements
+from .export import process_fieldstacks_parallel
 
 # Create a Typer application
 app = typer.Typer(
@@ -64,4 +64,3 @@ def run(
 
 if __name__ == "__main__":
     app()
-
