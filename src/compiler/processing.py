@@ -71,11 +71,27 @@ def parse_measurement(wpi_path: Path) -> CellVoyagerAcquisition:
         raise FileNotFoundError(f"{wpi_path} does not exist.")
     wpi_dict = read_and_parse_xml(wpi_path, model_name='WellPlate')
     parent_folder = wpi_path.parent
-    mlf_dict = read_and_parse_xml(parent_folder / "MeasurementData.mlf", model_name='MeasurementData')
-    mrf_dict = read_and_parse_xml(parent_folder / "MeasurementDetail.mrf", model_name='MeasurementDetail')
-    mes_path = (
-            wpi_path.parent / mrf_dict["MeasurementSettingFileName"]
-    )
+
+    mlf_path = parent_folder / "MeasurementData.mlf"
+    mrf_path = parent_folder / "MeasurementDetail.mrf"
+    if not path_exists(mlf_path):
+        raise FileNotFoundError(f"Missing MeasurementData.mlf next to {wpi_path}")
+    if not path_exists(mrf_path):
+        raise FileNotFoundError(f"Missing MeasurementDetail.mrf next to {wpi_path}")
+
+    mlf_dict = read_and_parse_xml(mlf_path, model_name='MeasurementData')
+    mrf_dict = read_and_parse_xml(mrf_path, model_name='MeasurementDetail')
+
+    setting_filename = mrf_dict.get("MeasurementSettingFileName")
+    if not setting_filename:
+        raise ValueError(
+            f"MeasurementDetail at {mrf_path} has no MeasurementSettingFileName"
+        )
+    mes_path = parent_folder / setting_filename
+    if not path_exists(mes_path):
+        raise FileNotFoundError(
+            f"Measurement setting file {mes_path} referenced from MRF does not exist"
+        )
     mes_dict = read_and_parse_xml(mes_path, model_name='MeasurementSetting')
 
     return CellVoyagerAcquisition(
@@ -165,10 +181,19 @@ def parse_measurements(
         raise ValueError("No *.wpi files provided to parse_measurements")
 
     acquisitions: List[CellVoyagerAcquisition] = []
+    accepted_paths: List[Path] = []
     for path in wpi_paths:
         if not path_exists(path):
-            raise FileNotFoundError(path)
-        acquisitions.append(parse_measurement(path))
+            logger.warning("Skipping missing path: %s", path)
+            continue
+        try:
+            acquisitions.append(parse_measurement(path))
+            accepted_paths.append(path)
+        except Exception as exc:
+            logger.error("Failed to parse %s: %s", path, exc)
+    if not acquisitions:
+        raise ValueError("No measurements could be parsed successfully.")
+    wpi_paths = accepted_paths
 
     # Merge image-level tables
     merged_records: list[pd.DataFrame] = []

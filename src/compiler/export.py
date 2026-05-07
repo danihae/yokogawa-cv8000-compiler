@@ -1,7 +1,8 @@
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from typing import Literal, Tuple, Union
 
 import dask
@@ -17,6 +18,9 @@ from .metadata import CellVoyagerAcquisition
 from .discovery import logger
 
 
+TileMode = Literal["per-field", "stitch"]
+
+
 def _get_well_id(row: int, column: int) -> str:
     """
     Converts row and column indices to a standard well ID format.
@@ -24,9 +28,9 @@ def _get_well_id(row: int, column: int) -> str:
     Parameters
     ----------
     row : int
-        Row index (0-based).
+        Row index (1-based, as stored in the Yokogawa MLF).
     column : int
-        Column index (0-based).
+        Column index (1-based, as stored in the Yokogawa MLF).
 
     Returns
     -------
@@ -35,12 +39,12 @@ def _get_well_id(row: int, column: int) -> str:
 
     Examples
     --------
-    >>> _get_well_id(0, 0)
+    >>> _get_well_id(1, 1)
     'A01'
-    >>> _get_well_id(1, 11)
+    >>> _get_well_id(2, 12)
     'B12'
     """
-    return f"{chr(65 + row)}{column + 1:02d}"
+    return f"{chr(64 + row)}{column:02d}"
 
 
 def _all_equal(iterator):
@@ -208,8 +212,327 @@ def _make_correction_func(dark: np.ndarray, gain: np.ndarray):
     return _correct
 
 
+def _empirical_time_metadata(timestamps: list) -> dict:
+    """Derive empirical per-frame intervals and framerate from absolute timestamps.
+
+    Image-level ``Time`` strings live in the MLF; we keep the earliest one per
+    timepoint as ``timestamps``. From those we compute:
+
+    - ``RelativeTimes`` — seconds since the first timepoint, one per T.
+    - ``FrameIntervals`` — successive deltas in seconds.
+    - ``TimeIncrement`` — median frame interval (s); robust to a missed frame.
+    - ``FramerateHz`` — ``1 / TimeIncrement``.
+
+    Returns ``{}`` when fewer than two parseable timestamps are available.
+    """
+    parsed: list = []
+    for ts in timestamps:
+        if ts is None:
+            parsed.append(None)
+            continue
+        try:
+            parsed.append(pd.to_datetime(ts))
+        except Exception:
+            parsed.append(None)
+
+    valid = [t for t in parsed if t is not None]
+    if len(valid) < 2:
+        return {}
+
+    t0 = valid[0]
+    relative = [
+        float((t - t0).total_seconds()) if t is not None else None for t in parsed
+    ]
+    intervals = [
+        float((parsed[i] - parsed[i - 1]).total_seconds())
+        for i in range(1, len(parsed))
+        if parsed[i] is not None and parsed[i - 1] is not None
+    ]
+    out: dict = {
+        "RelativeTimes": relative,
+        "RelativeTimesUnit": "s",
+    }
+    if intervals:
+        out["FrameIntervals"] = intervals
+        median_dt = float(np.median(intervals))
+        out["TimeIncrement"] = median_dt
+        out["TimeIncrementUnit"] = "s"
+        if median_dt > 0:
+            out["FramerateHz"] = 1.0 / median_dt
+    return out
+
+
+def _timeline_metadata(
+    acquisition_metadata: List[CellVoyagerAcquisition],
+    acquisition_indices,
+    timeline_index: int,
+) -> dict:
+    """Pull configured timing values from the .mes ``Timeline`` element.
+
+    Yokogawa's BTS XML defines ``Period``, ``Interval``, and ``ExpectedTime``
+    per ``Timeline``; the units are not explicit in the schema but are
+    surfaced as raw values for reference. When merging across acquisitions, we
+    use the timeline from the first acquisition in the group.
+    """
+    if len(acquisition_indices) == 0:
+        return {}
+    acq = acquisition_metadata[int(acquisition_indices[0])]
+    timelines = acq.measurement_setting.timelapse.timeline
+    if timeline_index < 1 or timeline_index > len(timelines):
+        return {}
+    tl = timelines[timeline_index - 1]
+    return {
+        "TimelineName": tl.name,
+        "TimelinePeriod": tl.period,
+        "TimelineInterval": tl.interval,
+        "TimelineExpectedTime": tl.expected_time,
+    }
+
+
+def _feather_mask(h: int, w: int, overlap_y: int, overlap_x: int) -> np.ndarray:
+    """2D blending mask with linear ramps in the overlap regions at each tile edge.
+
+    Always strictly positive, so overlap-aware sums can be normalised by
+    accumulated weights without divide-by-zero handling.
+    """
+    ramp_y = np.ones(h, dtype=np.float32)
+    if overlap_y > 0:
+        ramp = (np.arange(overlap_y, dtype=np.float32) + 1.0) / (overlap_y + 1.0)
+        ramp_y[:overlap_y] = ramp
+        ramp_y[h - overlap_y:] = ramp[::-1]
+    ramp_x = np.ones(w, dtype=np.float32)
+    if overlap_x > 0:
+        ramp = (np.arange(overlap_x, dtype=np.float32) + 1.0) / (overlap_x + 1.0)
+        ramp_x[:overlap_x] = ramp
+        ramp_x[w - overlap_x:] = ramp[::-1]
+    return ramp_y[:, None] * ramp_x[None, :]
+
+
+def _stitch_tile_arrays(
+    tile_arrays: dict[Tuple[int, int], xr.DataArray],
+    overlap_x: int,
+    overlap_y: int,
+) -> xr.DataArray:
+    """Place a regular grid of tiles into a single mosaic with feathered blending.
+
+    Tiles must share Y/X shape. (tx, ty) keys are 1-based tile indices on the
+    stage grid; missing tiles in the rectangle simply remain at zero in the
+    output.
+
+    The output replaces the (Y, X) dims with mosaic dims of the same names.
+    All other dims (T, C, Z, ...) are preserved.
+    """
+    keys = list(tile_arrays.keys())
+    txs = sorted({k[0] for k in keys})
+    tys = sorted({k[1] for k in keys})
+    sample = next(iter(tile_arrays.values()))
+    h = int(sample.sizes['Y'])
+    w = int(sample.sizes['X'])
+    step_x = max(w - overlap_x, 1)
+    step_y = max(h - overlap_y, 1)
+    out_h = (len(tys) - 1) * step_y + h
+    out_w = (len(txs) - 1) * step_x + w
+
+    other_dims = [d for d in sample.dims if d not in ('Y', 'X')]
+    other_shape = tuple(int(sample.sizes[d]) for d in other_dims)
+
+    accum = np.zeros(other_shape + (out_h, out_w), dtype=np.float32)
+    weight_acc = np.zeros((out_h, out_w), dtype=np.float32)
+
+    feather = _feather_mask(h, w, overlap_y, overlap_x)
+
+    in_dtype = sample.dtype
+
+    tx_pos = {tx: i for i, tx in enumerate(txs)}
+    ty_pos = {ty: i for i, ty in enumerate(tys)}
+
+    for (tx, ty), tile in tile_arrays.items():
+        # Materialise into numpy with axes (other_dims..., Y, X)
+        tile_np = tile.transpose(*other_dims, 'Y', 'X').values.astype(np.float32, copy=False)
+        y0 = ty_pos[ty] * step_y
+        x0 = tx_pos[tx] * step_x
+        accum[..., y0:y0 + h, x0:x0 + w] += tile_np * feather
+        weight_acc[y0:y0 + h, x0:x0 + w] += feather
+
+    weight_acc = np.maximum(weight_acc, 1e-9)
+    mosaic = accum / weight_acc
+
+    if np.issubdtype(in_dtype, np.integer):
+        info = np.iinfo(in_dtype)
+        mosaic = np.clip(mosaic, info.min, info.max).astype(in_dtype)
+    else:
+        mosaic = mosaic.astype(in_dtype)
+
+    coords = {d: sample.coords[d] for d in other_dims if d in sample.coords}
+    coords['Y'] = np.arange(out_h)
+    coords['X'] = np.arange(out_w)
+
+    return xr.DataArray(mosaic, dims=other_dims + ['Y', 'X'], coords=coords)
+
+
+def _build_correction_funcs(
+    df: pd.DataFrame,
+    acquisition_metadata: list[CellVoyagerAcquisition],
+    begin_times,
+    acquisition_indices,
+    action: str,
+) -> dict[Tuple[int, int], object]:
+    """Return per-(acquisition, channel) shading-correction callables.
+
+    Skips the correction (returning no entry) for any channel whose dark or
+    flat-field reference TIFF is missing, rather than crashing the run.
+    """
+    correction_funcs: dict[Tuple[int, int], object] = {}
+    if "BF" in action:
+        return correction_funcs
+    for begin_time, acquisition_index in zip(begin_times, acquisition_indices):
+        meta = acquisition_metadata[int(acquisition_index)]
+        df_acq = df[df["begin_time"] == begin_time]
+        parent = os.path.dirname(str(df_acq.iloc[0]["tif_path"]))
+        for ch in np.sort(df_acq["ch"].unique()):
+            key = (int(acquisition_index), int(ch))
+            if key in correction_funcs:
+                continue
+            try:
+                ch_meta = meta.measurement_detail.measurement_channel[int(ch) - 1]
+                camera = ch_meta.camera_number
+                shading = ch_meta.shading_correction_source
+                if not shading:
+                    logger.warning(
+                        "No shading correction source for ch=%s in acquisition %s; skipping correction",
+                        ch, acquisition_index,
+                    )
+                    continue
+                dark_path = os.path.join(parent, f"DC_DCAM#{camera}_CAM{camera}.tif")
+                flat_path = os.path.join(parent, shading)
+                if not os.path.exists(dark_path) or not os.path.exists(flat_path):
+                    logger.warning(
+                        "Missing correction TIFF for ch=%s (dark=%s flat=%s); skipping correction",
+                        ch, dark_path, flat_path,
+                    )
+                    continue
+                dark = _read_tif(dark_path).astype(np.float32)
+                flat = _read_tif(flat_path).astype(np.float32)
+                ff = flat - dark
+                gain = np.mean(ff) / ff
+                gain[np.isinf(gain)] = 0
+                correction_funcs[key] = _make_correction_func(dark, gain)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to build correction for ch=%s in acquisition %s: %s",
+                    ch, acquisition_index, exc,
+                )
+    return correction_funcs
+
+
+def _build_tile_array(
+    df: pd.DataFrame,
+    correction_funcs: dict[Tuple[int, int], object],
+    begin_times,
+    acquisition_indices,
+    n_y: int,
+    n_x: int,
+) -> Tuple[xr.DataArray, list]:
+    """Assemble a lazy (T, C, Z, Y, X) DataArray from a DataFrame for one tile/field.
+
+    Returns the DataArray plus a list of per-timepoint timestamps (the earliest
+    image time inside each timepoint group).
+    """
+    def load_and_correct(tif_path, correct_func=None):
+        img = _read_tif(tif_path)
+        if correct_func is not None:
+            img = correct_func(img)
+        return img
+
+    data = []
+    timestamps: list = []
+
+    channels_list = df["ch"].unique()
+    channels_list.sort()
+    n_z_indices = len(df["z_index"].unique())
+
+    for begin_time, acquisition_index in zip(begin_times, acquisition_indices):
+        df_acq = df[df["begin_time"] == begin_time]
+        if df_acq.empty:
+            continue
+        time_points = np.sort(df_acq["time_point"].unique())
+        z_indices = np.sort(df_acq["z_index"].unique())
+
+        for time_point in time_points:
+            min_time = None
+            t_data = []
+            for ch in channels_list:
+                _correct_img = correction_funcs.get((int(acquisition_index), int(ch)))
+
+                c_data = []
+                for z_index in z_indices:
+                    df_img = df_acq[
+                        (df_acq["time_point"] == time_point)
+                        & (df_acq["ch"] == ch)
+                        & (df_acq["z_index"] == z_index)
+                    ]
+                    if len(df_img) != 1:
+                        logger.warning(
+                            "Expected 1 file for (time=%s, ch=%s, z=%s), found %s",
+                            time_point, ch, z_index, len(df_img),
+                        )
+                        continue
+
+                    tif_path_full = df_img.iloc[0]["tif_path"]
+                    time_current = df_img.iloc[0]["time"]
+                    if min_time is None or time_current < min_time:
+                        min_time = time_current
+
+                    delayed_img = da.from_delayed(
+                        dask.delayed(load_and_correct)(tif_path_full, _correct_img),
+                        shape=(n_y, n_x),
+                        dtype=np.uint16,
+                    )
+                    c_data.append(delayed_img)
+
+                t_data.append(da.stack(c_data, axis=0))  # Z
+
+            data.append(da.stack(t_data, axis=0))  # C
+            timestamps.append(min_time)
+
+    n_time_points = len(data)
+    arr = xr.DataArray(
+        da.stack(data, axis=0),
+        dims=['T', 'C', 'Z', 'Y', 'X'],
+        coords={
+            'T': np.arange(n_time_points),
+            'C': channels_list,
+            'Z': np.arange(n_z_indices),
+            'Y': np.arange(n_y),
+            'X': np.arange(n_x),
+        },
+    )
+    return arr, timestamps
+
+
+def _apply_z_projection(arr: xr.DataArray, current_z_mode: str) -> xr.DataArray:
+    """Apply a Z-projection lazily according to ``current_z_mode``."""
+    if current_z_mode == "mip":
+        return arr.max(dim='Z')
+    if current_z_mode == "maxz":
+        mean_intensity = arr.mean(dim=['T', 'C', 'Y', 'X'])
+        best_z_concrete = mean_intensity.argmax(dim='Z').compute()
+        return arr.isel(Z=best_z_concrete)
+    if current_z_mode in ("osbm", "max_entropy", "min_entropy"):
+        arr = arr.chunk({'Z': -1})
+        template = arr.isel(Z=0, drop=True)
+        if current_z_mode == "osbm":
+            projection_func = osbm_projection
+        elif current_z_mode == "max_entropy":
+            projection_func = max_entropy_projection
+        else:
+            projection_func = min_entropy_projection
+        return arr.map_blocks(projection_func, template=template)
+    return arr
+
+
 def write_fieldstack(
-        key: Tuple[int, int, int, int, int, str],
+        key: Tuple,
         df: pd.DataFrame,
         acquisition_metadata: Union[CellVoyagerAcquisition, list[CellVoyagerAcquisition]],
         out_dir: Union[Path, str],
@@ -221,20 +544,23 @@ def write_fieldstack(
         compress: str | None = "lzw",
         overwrite: bool = False,
         dry_run: bool = False,
+        tile_mode: TileMode = "per-field",
 ) -> None:
     """
-    Writes a 5D image stack for a single field as a well-annotated OME-TIFF file.
-
-    Processes microscopy image data from a DataFrame, applies optional corrections
-    and Z-projections lazily using xarray, and writes the result using TiffFile.
+    Writes a 5D image stack for a single field — or a stitched mosaic of tiles —
+    as a well-annotated OME-TIFF file.
 
     Parameters
     ----------
-    key : tuple of (int, int, int, int, int, str)
-        Tuple identifying the data: (row, column, field_index, timeline_index, action_index, action_name).
+    key : tuple
+        Group identifier. For ``tile_mode="per-field"``: ``(row, column,
+        field_index, timeline_index, action_index, action)``. For
+        ``tile_mode="stitch"``: ``(row, column, partial_tile_index,
+        timeline_index, action_index, action)``.
     df : DataFrame
         Pandas DataFrame with image records. Expected columns: 'ch', 'time_point', 'z_index', 'tif_path',
-        'timestamp', 'acquisition_index', 'begin_time'.
+        'time', 'acquisition_index', 'begin_time'. For tiled stitching also requires
+        'tile_x_index', 'tile_y_index', 'partial_tile_index'.
     acquisition_metadata : CellVoyagerAcquisition or list of CellVoyagerAcquisition
         Metadata for the experiment acquisitions.
     out_dir : Path or str
@@ -253,25 +579,36 @@ def write_fieldstack(
         If True, overwrite existing files (default is False).
     dry_run : bool, optional
         If True, skip file I/O but perform other steps (default is False).
+    tile_mode : {"per-field", "stitch"}, optional
+        How to handle tiled acquisitions. ``"per-field"`` writes one file per
+        field. ``"stitch"`` blends a tile grid (TileXIndex × TileYIndex) into a
+        single mosaic per partial-tile group.
 
     Returns
     -------
     None
-
-    Raises
-    ------
-    ValueError
-        If acquisitions have inconsistent channels or Z-slices, or pixel sizes differ.
-    AssertionError
-        If DataFrame size does not match expected image count.
     """
-    row, column, field_index, timeline_index, action_index, action = key
+    if len(key) == 7:
+        row, column, group_id, timeline_index, action_index, action, split_acq_idx = key
+    else:
+        row, column, group_id, timeline_index, action_index, action = key
+        split_acq_idx = None
     well_id = _get_well_id(row, column)
 
     current_z_mode = z_mode if action != "BF3D" else z_mode_BF
 
+    # Determine tiling: stitch only when requested AND records carry tile indices.
+    is_tiled_group = (
+        tile_mode == "stitch"
+        and "tile_x_index" in df.columns
+        and df["tile_x_index"].notna().any()
+    )
+
     begin_times, acquisition_indices = (
-        df[["begin_time", "acquisition_index"]].drop_duplicates().sort_values("begin_time").T.values
+        df[["begin_time", "acquisition_index"]]
+        .drop_duplicates()
+        .sort_values("begin_time")
+        .T.values
     )
 
     _channels_per_acq = [df[df["begin_time"] == bt]["ch"].unique() for bt in begin_times]
@@ -283,149 +620,108 @@ def write_fieldstack(
         raise ValueError("Acquisitions have an unequal number of Z-slices and cannot be merged.")
 
     channels_list = _channels_per_acq[0]
+    channels_list = np.sort(channels_list)
     n_channels = len(channels_list)
     n_z_indices = _z_indices_per_acq[0]
     n_time_points = sum(len(df[df["begin_time"] == bt]["time_point"].unique()) for bt in begin_times)
 
-    expected_images = n_time_points * n_channels * n_z_indices
-    if len(df) != expected_images:
-        error_msg = (f"DataFrame size mismatch: got {len(df)} records, "
-                     f"but expected {n_time_points} timepoints × {n_channels} channels × "
-                     f"{n_z_indices} Z-indices = {expected_images}")
-        raise AssertionError(error_msg)
-
-    # Get image dimensions lazily from first image
+    # Image dimensions from the first record
     first_img_path = df.iloc[0]['tif_path']
-    sample_img = _read_tif(first_img_path)  # Load only one for shape
+    sample_img = _read_tif(first_img_path)
     n_y, n_x = sample_img.shape
 
-    # Prepare coordinates for xarray
-    time_coords = np.arange(n_time_points)
-    channel_coords = channels_list
-    z_coords = np.arange(n_z_indices)
-    y_coords = np.arange(n_y)
-    x_coords = np.arange(n_x)
-
-    # Create a list of lazy loaders for each image
-    def load_and_correct(tif_path, correct_func=None):
-        img = _read_tif(tif_path)
-        if correct_func:
-            img = correct_func(img)
-        return img
-
-    # Pre-compute correction functions once per (acquisition, channel).
-    # Without this, each (timepoint, channel) iteration would re-read dark/flat
-    # TIFFs and recompute the gain, multiplying disk I/O by n_timepoints.
+    # Build correction once for the whole group — same camera / shading per channel.
+    if isinstance(acquisition_metadata, list):
+        acq_list = acquisition_metadata
+    else:
+        acq_list = [acquisition_metadata]
     correction_funcs: dict[Tuple[int, int], object] = {}
-    if correct and "BF" not in action:
-        for begin_time, acquisition_index in zip(begin_times, acquisition_indices):
-            meta = acquisition_metadata[acquisition_index]
-            df_acq = df[df["begin_time"] == begin_time]
-            parent = os.path.dirname(str(df_acq.iloc[0]["tif_path"]))
-            for ch in np.sort(df_acq["ch"].unique()):
-                key = (int(acquisition_index), int(ch))
-                if key in correction_funcs:
-                    continue
-                camera = meta.measurement_detail.measurement_channel[ch - 1].camera_number
-                dark_path = parent + "/" + f"DC_DCAM#{camera}_CAM{camera}.tif"
-                dark = _read_tif(dark_path).astype(np.float32)
-                flat_path = parent + "/" + meta.measurement_detail.measurement_channel[
-                    ch - 1].shading_correction_source
-                flat = _read_tif(flat_path).astype(np.float32)
-                ff = flat - dark
-                gain = np.mean(ff) / ff
-                gain[np.isinf(gain)] = 0
-                correction_funcs[key] = _make_correction_func(dark, gain)
+    if correct:
+        correction_funcs = _build_correction_funcs(
+            df, acq_list, begin_times, acquisition_indices, action
+        )
 
-    # Build xarray with lazy loading using Dask delays
-    data = []
-    timestamps = []
-    time_point_counter = 0
-    for begin_time, acquisition_index in zip(begin_times, acquisition_indices):
-        df_acq = df[df["begin_time"] == begin_time]
-        time_points = np.sort(df_acq["time_point"].unique())
-        channels = np.sort(df_acq["ch"].unique())
-        z_indices = np.sort(df_acq["z_index"].unique())
+    # Validate per-tile or per-field counts.
+    if is_tiled_group:
+        tile_pairs = (
+            df.dropna(subset=["tile_x_index", "tile_y_index"])
+              [["tile_x_index", "tile_y_index"]]
+              .drop_duplicates()
+              .astype(int)
+              .itertuples(index=False, name=None)
+        )
+        tile_pairs = list(tile_pairs)
+        n_tiles = len(tile_pairs)
+        expected_images = n_time_points * n_channels * n_z_indices * n_tiles
+    else:
+        n_tiles = 1
+        expected_images = n_time_points * n_channels * n_z_indices
 
-        for t, time_point in enumerate(time_points):
-            min_time = None
-            t_data = []
-            for c, ch in enumerate(channels):
-                _correct_img = correction_funcs.get((int(acquisition_index), int(ch)))
+    if len(df) != expected_images:
+        error_msg = (
+            f"DataFrame size mismatch: got {len(df)} records, "
+            f"but expected {n_time_points} timepoints × {n_channels} channels × "
+            f"{n_z_indices} Z-indices × {n_tiles} tiles = {expected_images}"
+        )
+        raise AssertionError(error_msg)
 
-                c_data = []
-                for z, z_index in enumerate(z_indices):
-                    df_img = df_acq[
-                        (df_acq["time_point"] == time_point) &
-                        (df_acq["ch"] == ch) &
-                        (df_acq["z_index"] == z_index)
-                        ]
-                    if len(df_img) != 1:
-                        logger.warning(
-                            f"Expected 1 file for (time={time_point}, ch={ch}, z={z_index}), found {len(df_img)}")
-                        continue
+    timestamps: list = []
+    if is_tiled_group:
+        # Build per-tile DataArrays then stitch into a single mosaic.
+        tile_arrays: dict[Tuple[int, int], xr.DataArray] = {}
+        per_tile_timestamps: list[list] = []
+        for (tx, ty) in tile_pairs:
+            tile_df = df[
+                (df["tile_x_index"] == tx) & (df["tile_y_index"] == ty)
+            ]
+            tile_arr, ts = _build_tile_array(
+                tile_df, correction_funcs, begin_times, acquisition_indices, n_y, n_x
+            )
+            tile_arrays[(int(tx), int(ty))] = tile_arr
+            per_tile_timestamps.append(ts)
 
-                    tif_path_full = df_img.iloc[0]["tif_path"]
-                    time_current = df_img.iloc[0]["time"]
-                    if min_time is None:
-                        min_time = time_current
-                    elif time_current < min_time:
-                        min_time = time_current
+        # Use timestamps from the first tile (timepoints are taken roughly together).
+        timestamps = per_tile_timestamps[0]
 
-                    delayed_img = da.from_delayed(dask.delayed(load_and_correct)(tif_path_full, _correct_img),
-                                                  shape=(n_y, n_x), dtype=np.uint16)
-                    c_data.append(delayed_img)
+        # Resolve per-timeline overlap from the first acquisition that has a tile spec.
+        overlap = 0
+        for acq in acq_list:
+            ptp = acq.get_partial_tiled_position(int(timeline_index))
+            if ptp is not None:
+                overlap = int(ptp.overlapping_pixels)
+                break
+        arr = _stitch_tile_arrays(tile_arrays, overlap_x=overlap, overlap_y=overlap)
+    else:
+        arr, timestamps = _build_tile_array(
+            df, correction_funcs, begin_times, acquisition_indices, n_y, n_x
+        )
 
-                t_data.append(da.stack(c_data, axis=0))  # Stack Z
+    arr = _apply_z_projection(arr, current_z_mode)
 
-            data.append(da.stack(t_data, axis=0))  # Stack C
-            timestamps.append(min_time)
-
-        time_point_counter += len(time_points)
-
-    # Create lazy xarray DataArray
-    arr = xr.DataArray(da.stack(data, axis=0), dims=['T', 'C', 'Z', 'Y', 'X'],
-                       coords={'T': time_coords[:len(data)], 'C': channel_coords, 'Z': z_coords, 'Y': y_coords,
-                               'X': x_coords})
-
-    # Apply Z-projection lazily
-    if current_z_mode == "mip":
-        arr = arr.max(dim='Z')
-    elif current_z_mode == "maxz":
-        mean_intensity = arr.mean(dim=['T', 'C', 'Y', 'X'])
-        best_z_lazy = mean_intensity.argmax(dim='Z')
-        best_z_concrete = best_z_lazy.compute()
-        arr = arr.isel(Z=best_z_concrete)
-    elif current_z_mode in ["osbm", "max_entropy", "min_entropy"]:
-        # Projection functions need the full Z stack per call, so collapse the
-        # Z axis into a single dask chunk before mapping.
-        arr = arr.chunk({'Z': -1})
-
-        # This template correctly defines the expected output shape and dimensions
-        template = arr.isel(Z=0, drop=True)
-
-        # Select the appropriate projection function
-        if current_z_mode == "osbm":
-            projection_func = osbm_projection
-        elif current_z_mode == "max_entropy":
-            projection_func = max_entropy_projection
-        elif current_z_mode == "min_entropy":
-            projection_func = min_entropy_projection
-
-        arr = arr.map_blocks(projection_func, template=template)
-
-    # Squeeze dimensions
     arr = arr.squeeze()
     axes = "".join(arr.dims)
 
-    # Metadata handling with non-standard keys merged into main dict
+    # Pick a reference acquisition for OME metadata.
+    first_acq_index = int(acquisition_indices[0])
     if isinstance(acquisition_metadata, list):
-        acquisition_metadata = acquisition_metadata[acquisition_indices[0]]
+        ref_meta = acquisition_metadata[first_acq_index]
+    else:
+        ref_meta = acquisition_metadata
 
-    channel_list = acquisition_metadata.measurement_setting.channel_list.channel
-    pixel_sizes_x = [ch.horizontal_pixel_dimension for ch in
-                     acquisition_metadata.measurement_detail.measurement_channel]
-    pixel_sizes_y = [ch.vertical_pixel_dimension for ch in acquisition_metadata.measurement_detail.measurement_channel]
+    channel_list = ref_meta.measurement_setting.channel_list.channel
+    # Only consider channels that are actually used by this group; the .mrf
+    # MeasurementChannel list can include unused channels acquired with a
+    # different objective (different pixel size).
+    channel_meta_by_ch = {
+        ch.ch: ch for ch in ref_meta.measurement_detail.measurement_channel
+    }
+    used_meta = [
+        channel_meta_by_ch[int(ch_num)]
+        for ch_num in channels_list
+        if int(ch_num) in channel_meta_by_ch
+    ]
+    pixel_sizes_x = [m.horizontal_pixel_dimension for m in used_meta]
+    pixel_sizes_y = [m.vertical_pixel_dimension for m in used_meta]
 
     if len(set(pixel_sizes_y)) > 1 or len(set(pixel_sizes_x)) > 1:
         raise ValueError("Pixel sizes differ between channels and cannot be reconciled.")
@@ -433,7 +729,6 @@ def write_fieldstack(
     physical_size_y = pixel_sizes_y[0] if pixel_sizes_y else 1.0
     physical_size_x = pixel_sizes_x[0] if pixel_sizes_x else 1.0
 
-    # Combined metadata (standard OME + non-standard)
     ome_metadata = {
         "axes": axes,
         "PhysicalSizeY": physical_size_y,
@@ -441,19 +736,33 @@ def write_fieldstack(
         "PhysicalSizeYUnit": "µm",
         "PhysicalSizeXUnit": "µm",
         "Channels": [],
-        "PlateType": acquisition_metadata.measurement_detail.measurement_sample_plate.name,
-        "Operator": acquisition_metadata.measurement_detail.operator_name,
+        "PlateType": ref_meta.measurement_detail.measurement_sample_plate.name,
+        "Operator": ref_meta.measurement_detail.operator_name,
         "Timestamps": timestamps,
         "WellID": well_id,
-        "FieldIndex": field_index,
         "ActionIndex": action_index,
         "Action": action,
-        "ZMode": current_z_mode
+        "ZMode": current_z_mode,
     }
+    if is_tiled_group:
+        ome_metadata["PartialTileIndex"] = group_id
+        ome_metadata["Stitched"] = True
+        ome_metadata["TileGridX"] = len({k[0] for k in tile_arrays.keys()})
+        ome_metadata["TileGridY"] = len({k[1] for k in tile_arrays.keys()})
+    else:
+        ome_metadata["FieldIndex"] = group_id
 
-    for i, ch_num in enumerate(channels_list):
-        if i < len(channel_list):
-            ch_meta = channel_list[i]
+    if split_acq_idx is not None:
+        ome_metadata["AcquisitionIndex"] = int(split_acq_idx)
+        ome_metadata["MergedAcquisitions"] = False
+
+    ome_metadata.update(_timeline_metadata(acq_list, acquisition_indices, int(timeline_index)))
+    ome_metadata.update(_empirical_time_metadata(timestamps))
+
+    channel_setting_by_ch = {ch.ch: ch for ch in channel_list}
+    for ch_num in channels_list:
+        ch_meta = channel_setting_by_ch.get(int(ch_num))
+        if ch_meta is not None:
             ch_dict = {
                 "Name": f"Channel_{ch_num}",
                 "Magnification": ch_meta.magnification,
@@ -462,7 +771,7 @@ def write_fieldstack(
                 "Acquisition": ch_meta.acquisition,
                 "Method": ch_meta.method,
                 "LightSource": ch_meta.light_source_name,
-                "Fluorophore": ch_meta.fluorophore
+                "Fluorophore": ch_meta.fluorophore,
             }
         else:
             ch_dict = {"Name": f"Channel_{ch_num}"}
@@ -472,7 +781,18 @@ def write_fieldstack(
     output_directory.mkdir(exist_ok=True)
     magnification = ome_metadata["Channels"][0].get('Magnification', 0)
     prefix = f"{title}_" if title else ""
-    fname = f"{prefix}{well_id}_F{field_index:02d}_L{timeline_index}_A{action_index}_{action}_{magnification}x.ome.tif"
+    rec_suffix = f"_R{int(split_acq_idx):02d}" if split_acq_idx is not None else ""
+    if is_tiled_group:
+        # Mosaic file naming uses the partial-tile index in place of field.
+        fname = (
+            f"{prefix}{well_id}_M{int(group_id):02d}_L{timeline_index}_A{action_index}"
+            f"_{action}_{magnification}x{rec_suffix}.ome.tif"
+        )
+    else:
+        fname = (
+            f"{prefix}{well_id}_F{int(group_id):02d}_L{timeline_index}_A{action_index}"
+            f"_{action}_{magnification}x{rec_suffix}.ome.tif"
+        )
     destination = output_directory / fname
 
     if destination.exists() and not overwrite:
@@ -482,19 +802,7 @@ def write_fieldstack(
     logger.info("Writing %s (axes=%s, shape=%s)", destination, axes, arr.shape)
 
     def clean_metadata_for_json(obj):
-        """
-        Recursively converts NumPy types to JSON-serializable Python types.
-
-        Parameters
-        ----------
-        obj : any
-            Object to clean (dict, list, NumPy array, etc.).
-
-        Returns
-        -------
-        any
-            Cleaned object suitable for JSON serialization.
-        """
+        """Recursively converts NumPy types to JSON-serializable Python types."""
         if isinstance(obj, dict):
             return {k: clean_metadata_for_json(v) for k, v in obj.items()}
         if isinstance(obj, list):
@@ -507,20 +815,111 @@ def write_fieldstack(
 
     clean_metadata = clean_metadata_for_json(ome_metadata)
 
-    # Compute and write using tifffile
+    # tifffile's OME-XML writer only emits a fixed set of standard keys; any
+    # other keys are silently dropped. Move our non-standard payload into the
+    # OME Image Description as a JSON blob so it actually gets persisted, and
+    # keep OME-standard keys (TimeIncrement etc.) at the top level so they
+    # render in the proper OME slots.
+    OME_STANDARD = {
+        "axes",
+        "PhysicalSizeX", "PhysicalSizeY", "PhysicalSizeZ",
+        "PhysicalSizeXUnit", "PhysicalSizeYUnit", "PhysicalSizeZUnit",
+        "TimeIncrement", "TimeIncrementUnit",
+        "Channels", "Plane", "Description", "Creator", "Name",
+    }
+    extras = {k: v for k, v in clean_metadata.items() if k not in OME_STANDARD}
+    write_meta = {k: v for k, v in clean_metadata.items() if k in OME_STANDARD}
+    if extras:
+        write_meta["Description"] = json.dumps(extras, default=str)
+
     if not dry_run:
-        arr_computed = arr.compute()  # Compute lazy data
+        if isinstance(arr.data, da.Array):
+            arr_computed = arr.compute()
+            data_to_write = arr_computed.values
+        else:
+            data_to_write = arr.values
         tifffile.imwrite(
             destination,
-            arr_computed.values,  # Extract NumPy array from xarray
-            metadata=clean_metadata,
+            data_to_write,
+            metadata=write_meta,
             bigtiff=True,
             compression=compress,
         )
 
 
+def _make_fieldstack_groups(
+    merged_records_df: pd.DataFrame,
+    tile_mode: TileMode,
+    no_merge_actions: Optional[List[str]] = None,
+) -> List[Tuple[Tuple, pd.DataFrame]]:
+    """Group records into work units suitable for ``write_fieldstack``.
+
+    In ``"per-field"`` mode (default) every (row, column, field_index, timeline,
+    action_index, action) gets its own group — preserving prior behaviour
+    regardless of whether records carry tile indices.
+
+    In ``"stitch"`` mode tiled records are grouped by ``partial_tile_index``
+    instead of ``field_index`` so that all tiles in a mosaic land in the same
+    work unit. Non-tiled records still group by ``field_index``.
+
+    ``no_merge_actions`` (case-insensitive action names) suppresses merging of
+    timepoints across multiple WPI acquisitions for the listed actions. By
+    default, repeat WPI runs sharing the same (well, field, timeline, action)
+    are concatenated along T — desirable for slow long-term timelapses, but
+    wrong for rapid (BF/2D) bursts where each recording should stay its own
+    file. When an action matches, ``acquisition_index`` is appended to the
+    groupby and propagated as a 7th element of the group key.
+    """
+    no_merge = {a.strip().lower() for a in (no_merge_actions or []) if a.strip()}
+
+    groups: List[Tuple[Tuple, pd.DataFrame]] = []
+
+    if tile_mode == "stitch" and "tile_x_index" in merged_records_df.columns:
+        tiled_mask = merged_records_df["tile_x_index"].notna()
+        tiled_df = merged_records_df[tiled_mask]
+        non_tiled_df = merged_records_df[~tiled_mask]
+    else:
+        tiled_df = merged_records_df.iloc[0:0]
+        non_tiled_df = merged_records_df
+
+    def _split_by_action(df: pd.DataFrame):
+        """Yield (sub_df, split_acq) pairs splitting on the no-merge allowlist."""
+        if df.empty:
+            return
+        if not no_merge:
+            yield df, False
+            return
+        action_lower = df["action"].astype(str).str.lower()
+        mask = action_lower.isin(no_merge)
+        if mask.any():
+            yield df[mask], True
+        if (~mask).any():
+            yield df[~mask], False
+
+    def _emit(df: pd.DataFrame, group_col: str, split_acq: bool):
+        if df.empty:
+            return
+        cols = ["row", "column", group_col, "timeline_index", "action_index", "action"]
+        if split_acq:
+            cols.append("acquisition_index")
+        gb = df.groupby(cols, sort=False, dropna=True)
+        for tup, gdf in gb:
+            r, c, gid, tl, ai, act, *rest = tup
+            key: Tuple = (int(r), int(c), int(gid), int(tl), int(ai), str(act))
+            if split_acq:
+                key = key + (int(rest[0]),)
+            groups.append((key, gdf))
+
+    for sub, split in _split_by_action(tiled_df):
+        _emit(sub, "partial_tile_index", split)
+    for sub, split in _split_by_action(non_tiled_df):
+        _emit(sub, "field_index", split)
+
+    return groups
+
+
 def process_fieldstacks_parallel(
-    fieldstacks: pd.core.groupby.generic.DataFrameGroupBy,
+    merged_records_df: Union[pd.DataFrame, "pd.core.groupby.generic.DataFrameGroupBy"],
     acquisitions: List['CellVoyagerAcquisition'],
     out_dir: Union[str, Path],
     *,
@@ -530,23 +929,28 @@ def process_fieldstacks_parallel(
     correct: bool = True,
     overwrite: bool = True,
     max_workers: int = 4,
+    tile_mode: TileMode = "per-field",
+    no_merge_actions: Optional[List[str]] = None,
 ) -> None:
     """
-    Processes and writes field stacks to OME-TIFF files in parallel.
+    Process and write field stacks (or mosaics) to OME-TIFFs in parallel.
 
-    This function wraps the write_fieldstack call and uses a ThreadPoolExecutor
-    to parallelize the processing of each independent field stack.
+    Each field stack is one independent work unit, dispatched to a worker
+    thread. A failure inside one work unit is logged and the run continues —
+    one bad acquisition does not break the whole batch.
 
     Parameters
     ----------
-    fieldstacks : pandas.core.groupby.generic.DataFrameGroupBy
-        A DataFrame grouped by field stack identifiers.
+    merged_records_df : pandas.DataFrame or DataFrameGroupBy
+        Either a flat merged-records DataFrame (preferred) or a pre-built
+        DataFrameGroupBy (legacy callers). When a DataFrame is passed, grouping
+        is determined by ``tile_mode``.
     acquisitions : List[CellVoyagerAcquisition]
-        The list of acquisition metadata objects.
+        The list of acquisition metadata objects, indexed by acquisition_index.
     out_dir : Path
         The destination directory for the output OME-TIFF files.
     title : str or None, optional
-        Optional prefix for the output filenames. If None (default), no prefix is added.
+        Optional prefix for the output filenames.
     z_mode : str, optional
         The Z-projection mode for fluorescence channels, by default "maxz".
     z_mode_BF : str, optional
@@ -556,33 +960,48 @@ def process_fieldstacks_parallel(
     overwrite : bool, optional
         Whether to overwrite existing files, by default True.
     max_workers : int, optional
-        The number of parallel threads to use, by default 4. Adjust this
-        based on your system's core count and I/O capacity.
+        The number of parallel threads to use, by default 4.
+    tile_mode : {"per-field", "stitch"}, optional
+        Tile handling. See ``write_fieldstack`` for details.
+    no_merge_actions : list of str, optional
+        Action names (case-insensitive) for which timepoints should NOT be
+        merged across multiple WPI acquisitions. Default: merge everything
+        (current behaviour). Use e.g. ``["BF", "2D"]`` to keep each rapid
+        recording as its own file — files for split groups gain an
+        ``_R{acquisition_index:02d}`` suffix.
     """
 
-    def _process_single_stack(args):
-        """Helper function to unpack arguments for write_fieldstack."""
-        key, stack_df = args
-        write_fieldstack(
-            key,
-            stack_df,
-            acquisitions,
-            out_dir=out_dir,
-            title=title,
-            z_mode=z_mode,
-            z_mode_BF=z_mode_BF,
-            correct=correct,
-            overwrite=overwrite,
+    if isinstance(merged_records_df, pd.DataFrame):
+        groups = _make_fieldstack_groups(
+            merged_records_df, tile_mode, no_merge_actions
         )
+    else:
+        # Backwards compatibility — already a DataFrameGroupBy.
+        groups = list(merged_records_df)
 
-    # Use ThreadPoolExecutor to run the processing in parallel
+    def _process_single_stack(args):
+        key, stack_df = args
+        try:
+            write_fieldstack(
+                key,
+                stack_df,
+                acquisitions,
+                out_dir=out_dir,
+                title=title,
+                z_mode=z_mode,
+                z_mode_BF=z_mode_BF,
+                correct=correct,
+                overwrite=overwrite,
+                tile_mode=tile_mode,
+            )
+        except Exception as exc:
+            logger.error("Failed to write field stack %s: %s", key, exc, exc_info=True)
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # The list() consumes the iterator, ensuring all tasks complete.
-        # tqdm provides a progress bar over the submitted tasks.
         list(
             tqdm(
-                executor.map(_process_single_stack, fieldstacks),
-                total=len(fieldstacks),
-                desc="Processing field stacks"
+                executor.map(_process_single_stack, groups),
+                total=len(groups),
+                desc="Processing field stacks",
             )
         )

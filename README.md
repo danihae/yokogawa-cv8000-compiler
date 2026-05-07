@@ -56,6 +56,17 @@ Options:
   --out-dir PATH         Directory where OME-TIFF files will be saved [required]
   --title TEXT           Base name for output files (default: compiled_data)
   --z-mode TEXT          Z-projection mode for fluorescence channels (default: maxz)
+  --z-mode-bf TEXT       Z-projection mode for brightfield (BF3D) channels;
+                         one of: keep, osbm (default: keep)
+  --tile-mode TEXT       How to handle tiled acquisitions: 'per-field' (one
+                         OME-TIFF per FieldIndex, default) or 'stitch' (blend
+                         each PartialTileIndex grid into one mosaic file)
+  --no-merge-actions TEXT
+                         Comma-separated action names (e.g. 'BF,2D') for
+                         which timepoints should NOT be merged across
+                         multiple WPI acquisitions. Useful for rapid
+                         (~20 Hz) bursts. Files for split groups gain
+                         _R{idx:02d}. Default: merge everything.
   --exclude TEXT         Keyword to exclude measurements whose path contains this string
   --overwrite / --no-overwrite
                          Overwrite existing output files (default: True)
@@ -74,7 +85,52 @@ Options:
 | `max_entropy` | Select the Z-slice with the highest Shannon entropy                    |
 | `min_entropy` | Select the Z-slice with the lowest Shannon entropy                     |
 
-Brightfield channels (`BF3D` action) use a separate `--z-mode-bf` setting (not exposed in the CLI; defaults to `keep`).
+Brightfield channels (`BF3D` action) use the separate `--z-mode-bf` setting, which accepts `keep` or `osbm` and defaults to `keep`. `osbm` is the recommended choice for collapsing brightfield Z-stacks into a single sharp slice.
+
+### Tiled acquisitions
+
+When the original acquisition uses Yokogawa's `PartialTiledPosition` (each
+field is one tile of a larger grid), `--tile-mode` controls the output:
+
+| Mode         | Behaviour                                                                                          |
+|--------------|----------------------------------------------------------------------------------------------------|
+| `per-field`  | Default. One OME-TIFF per `FieldIndex` — equivalent to saving every tile as its own file.          |
+| `stitch`     | Blend each `PartialTileIndex` group of tiles into a single mosaic OME-TIFF with feathered overlap. |
+
+In `stitch` mode the output filename uses `M{partial_tile_index}` in place of
+`F{field_index}`, e.g. `plate1_A01_M01_L1_A1_3D_2x.ome.tif`. Non-tiled records
+remain `F{field_index}` regardless of `--tile-mode`.
+
+### Multiple recordings of the same well: merge or split?
+
+By default, when a directory contains multiple `.wpi` files that share the same
+well/field/timeline/action (e.g. an experiment that imaged the same plate on
+three consecutive days), their timepoints are concatenated along T into a single
+OME-TIFF. That's the right thing for slow long-term timelapses.
+
+For rapid time-lapses — typically `BF` or `2D` actions captured at ~20 Hz —
+each WPI run is its own short burst that should not be glued onto its
+neighbours. Use `--no-merge-actions` to split them:
+
+```bash
+compile-cv8000 --root-dir /data/plate --out-dir /out --no-merge-actions BF,2D
+```
+
+For matching actions, each `acquisition_index` gets its own OME-TIFF with an
+`_R{idx:02d}` suffix (R = "recording"), e.g. `plate_A01_F01_L1_A1_BF_60x_R02.ome.tif`.
+Other actions still merge as before.
+
+### OME metadata
+
+Each output file embeds the following in the `ImageDescription` (OME-XML):
+
+- Standard OME fields: `PhysicalSizeX/Y` (µm), `Channels`, `TimeIncrement` (s).
+- A JSON blob in `<Description>` with `Timestamps` (per-timepoint absolute ISO
+  strings), `RelativeTimes` (seconds since first frame), `FrameIntervals`,
+  `FramerateHz` (1 / median Δt), and the configured `TimelinePeriod` /
+  `TimelineInterval` / `TimelineExpectedTime` from the `.mes` file. This also
+  carries `WellID`, `FieldIndex` or `PartialTileIndex`, `ActionIndex`, `Action`,
+  `ZMode`, plus `AcquisitionIndex` / `MergedAcquisitions` when split.
 
 ### Examples
 

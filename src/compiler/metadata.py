@@ -1,5 +1,3 @@
-# Adapted from
-
 from pathlib import Path
 from typing import Annotated, Literal, Optional, Any
 
@@ -18,20 +16,21 @@ class Base(BaseModel):
 
 
 class MeasurementRecordBase(Base):
+    type: str
     time: str
     column: int
     row: int
-    field_index: int
     time_point: int
     timeline_index: int
     x: float
     y: float
-    value: str
+    value: str | None = None
+    field_index: int | None = None
+    partial_tile_index: int | None = None
 
 
 class ImageMeasurementRecord(MeasurementRecordBase):
     type: Literal["IMG"]
-    partial_tile_index: int | None = None
     tile_x_index: int | None = None
     tile_y_index: int | None = None
     z_index: int
@@ -44,22 +43,44 @@ class ImageMeasurementRecord(MeasurementRecordBase):
     ch: int
 
 
+class SoftFocusMeasurementRecord(MeasurementRecordBase):
+    """Records of in-line soft-focus measurements (Type=\"SF\").
+
+    The body holds the measured focus value rather than a TIF path.
+    """
+    type: Literal["SF"]
+    z_index: int | None = None
+    action_index: int | None = None
+    action: str | None = None
+    z: float | None = None
+    ch: int | None = None
+
+
 class ErrorMeasurementRecord(MeasurementRecordBase):
     type: Literal["ERR"]
 
 
 class MeasurementData(Base):
-    xmlns: Annotated[dict, Field(alias="xmlns")]
-    version: Literal["1.0"]
-    measurement_record: list[ImageMeasurementRecord | ErrorMeasurementRecord] | None = (
-        None
-    )
+    xmlns: Annotated[Optional[dict], Field(alias="xmlns", default=None)]
+    version: Optional[str] = None
+    measurement_record: list[
+        ImageMeasurementRecord | SoftFocusMeasurementRecord | ErrorMeasurementRecord
+    ] | None = None
+
+    @field_validator("measurement_record", mode="before")
+    @classmethod
+    def _ensure_list(cls, v):
+        if v is None or isinstance(v, list):
+            return v
+        if isinstance(v, dict):
+            return [v]
+        raise TypeError(f"Expected dict, list or None, got {type(v).__name__}")
 
 
 class MeasurementSamplePlate(Base):
     name: str
     well_plate_file_name: str
-    well_plate_product_file_name: str
+    well_plate_product_file_name: str | None = None
 
 
 class MeasurementChannel(Base):
@@ -71,45 +92,54 @@ class MeasurementChannel(Base):
     input_level: int
     horizontal_pixels: int
     vertical_pixels: int
-    filter_wheel_position: int
-    filter_position: int
-    shading_correction_source: str
-    objective_magnification_ratio: float
-    original_horizontal_pixels: int
-    original_vertical_pixels: int
+    filter_wheel_position: int | None = None
+    filter_position: int | None = None
+    shading_correction_source: str | None = None
+    objective_magnification_ratio: float | None = None
+    original_horizontal_pixels: int | None = None
+    original_vertical_pixels: int | None = None
 
 
 class MeasurementDetail(Base):
-    xmlns: Annotated[dict, Field(alias="xmlns")]
-    version: Literal["1.0"]
-    operator_name: str
-    title: str
-    application: str
+    xmlns: Annotated[Optional[dict], Field(alias="xmlns", default=None)]
+    version: Optional[str] = None
+    operator_name: str | None = None
+    title: str | None = None
+    application: str | None = None
     begin_time: str
-    end_time: str
+    end_time: str | None = None
     measurement_setting_file_name: str
     column_count: int
     row_count: int
     time_point_count: int
     field_count: int
     z_count: int
-    target_system: str
-    release_number: str
-    status: str
+    target_system: str | None = None
+    release_number: str | None = None
+    status: str | None = None
     measurement_sample_plate: MeasurementSamplePlate
     measurement_channel: list[MeasurementChannel]
 
+    @field_validator("measurement_channel", mode="before")
+    @classmethod
+    def _ensure_list(cls, v):
+        if v is None or isinstance(v, list):
+            return v
+        if isinstance(v, dict):
+            return [v]
+        raise TypeError(f"Expected dict, list or None, got {type(v).__name__}")
+
 
 class WellPlate(Base):
-    xmlns: Annotated[dict, Field(alias="xmlns")]
-    version: Literal["1.0"]
+    xmlns: Annotated[Optional[dict], Field(alias="xmlns", default=None)]
+    version: Optional[str] = None
     name: str
-    product_i_d: str
-    usage: str
-    density_unit: str
+    product_i_d: str | None = None
+    usage: str | None = None
+    density_unit: str | None = None
     columns: int
     rows: int
-    description: str
+    description: str | None = None
 
 
 class TargetWell(Base):
@@ -120,28 +150,16 @@ class TargetWell(Base):
 
 class WellSequence(Base):
     is_selected: bool = Field(alias='IsSelected')
-    target_well: Optional[list[TargetWell]] = Field(
-        default=None, alias='TargetWell'
-    )
+    target_well: Optional[list[TargetWell]] = Field(default=None, alias='TargetWell')
 
     @field_validator('target_well', mode='before')
     @classmethod
     def _ensure_list(cls, v: Any):
-        """Convert single dict to list containing that dict, or handle None."""
-        if v is None:
-            return None
+        if v is None or isinstance(v, list):
+            return v
         if isinstance(v, dict):
             return [v]
-        if isinstance(v, list):
-            return v
         raise ValueError(f'Expected dict, list, or None, got {type(v)}')
-
-    # @model_validator(mode='after')
-    # def _check_target_well_if_selected(self) -> 'WellSequence':
-    #     """Ensure target_well is required if is_selected is True."""
-    #     if self.is_selected and not self.target_well:
-    #         raise ValueError("target_well is required when is_selected is True")
-    #     return self
 
 
 class Point(Base):
@@ -172,13 +190,22 @@ class TiledArea(Base):
 
 class PartialTiledPosition(Base):
     overlapping_pixels: int = Field(alias="OverlappingPixels")
-    scan_method: Literal["Raster","Tile"] = Field(alias="ScanMethod")
+    scan_method: Literal["Raster", "Tile"] = Field(alias="ScanMethod")
     fill: str = Field(alias="Fill")
-    tiled_area: TiledArea = Field(alias="TiledArea")
+    tiled_area: list[TiledArea] = Field(alias="TiledArea")
+
+    @field_validator("tiled_area", mode="before")
+    @classmethod
+    def _ensure_list(cls, v: Any):
+        if v is None or isinstance(v, list):
+            return v
+        if isinstance(v, dict):
+            return [v]
+        raise TypeError(f"Expected dict, list or None, got {type(v).__name__}")
 
 
 class PointSequence(Base):
-    method: Literal["FixedPosition","PartialTiledPosition"] = Field(alias="Method")
+    method: Literal["FixedPosition", "PartialTiledPosition"] = Field(alias="Method")
     fixed_position: FixedPosition | None = None
     partial_tiled_position: PartialTiledPosition | None = None
 
@@ -208,7 +235,6 @@ class ActionAcquire3D(_ActionAcquireBase):
     @field_validator("ch", mode="before")
     @classmethod
     def _ensure_list_or_str(cls, v):
-        """Handle both single string and list of strings for ch field."""
         if isinstance(v, (str, list)):
             return v
         raise TypeError(f"Expected string or list, got {type(v).__name__}")
@@ -223,17 +249,26 @@ class ActionAcquireBF3D(_ActionAcquireBase):
 
 
 class ActionAcquireBF(_ActionAcquireBase):
-    z_offset: str = Field(alias="ZOffset")
+    z_offset: Optional[str] = Field(alias="ZOffset", default=None)
     live_option: Optional[LiveOption] = Field(alias="LiveOption", default=None)
     ch: str = Field(alias="Ch")
 
 
 class ActionAcquire(_ActionAcquireBase):
-    z_offset: str = Field(alias="ZOffset")
+    z_offset: Optional[str] = Field(alias="ZOffset", default=None)
     ignore_soft_focus: Optional[str] = Field(alias="IgnoreSoftFocus", default=None)
     connected_action: Optional[str] = Field(alias="ConnectedAction", default=None)
     live_option: Optional[LiveOption] = Field(alias="LiveOption", default=None)
     ch: str = Field(alias="Ch")
+
+
+class ActionSoftFocus(_ActionAcquireBase):
+    """Soft-focus probe action — produces SF-type measurement records but no TIFs."""
+    af_shift_base: Optional[str] = Field(alias="AFShiftBase", default=None)
+    top_distance: Optional[str] = Field(alias="TopDistance", default=None)
+    bottom_distance: Optional[str] = Field(alias="BottomDistance", default=None)
+    slice_length: Optional[str] = Field(alias="SliceLength", default=None)
+    ch: Optional[str | list[str]] = Field(alias="Ch", default=None)
 
 
 class ActionList(Base):
@@ -244,12 +279,14 @@ class ActionList(Base):
     action_acquire_3_d: Optional[list[ActionAcquire3D]] = Field(default=None, alias="ActionAcquire3D")
     action_acquire_bf: Optional[list[ActionAcquireBF]] = Field(default=None, alias="ActionAcquireBF")
     action_acquire_bf_3_d: Optional[list[ActionAcquireBF3D]] = Field(default=None, alias="ActionAcquireBF3D")
+    action_soft_focus: Optional[list[ActionSoftFocus]] = Field(default=None, alias="ActionSoftFocus")
 
     @field_validator(
         "action_acquire",
         "action_acquire_3_d",
         "action_acquire_bf",
         "action_acquire_bf_3_d",
+        "action_soft_focus",
         mode="before",
     )
     def _ensure_list(cls, v):
@@ -266,8 +303,8 @@ class Timeline(Base):
     period: int
     interval: int
     expected_time: int
-    color: str
-    override_expected_time: bool
+    color: str | None = None
+    override_expected_time: bool | None = None
     well_sequence: WellSequence
     point_sequence: PointSequence
     action_list: ActionList
@@ -278,11 +315,10 @@ class Timelapse(Base):
 
     @field_validator('timeline', mode='before')
     def _ensure_list(cls, v):
-        """Convert single dict to list containing that dict"""
+        if v is None or isinstance(v, list):
+            return v
         if isinstance(v, dict):
             return [v]
-        if isinstance(v, list):
-            return v
         raise ValueError(f'Expected dict or list, got {type(v)}')
 
 
@@ -297,46 +333,64 @@ class LightSourceList(Base):
     use_calibrated_laser_power: bool | None = None
     light_source: list[LightSource]
 
+    @field_validator("light_source", mode="before")
+    @classmethod
+    def _ensure_list(cls, v):
+        if v is None or isinstance(v, list):
+            return v
+        if isinstance(v, dict):
+            return [v]
+        raise TypeError(f"Expected dict, list or None, got {type(v).__name__}")
+
 
 class Channel(Base):
     ch: int
-    target: str
-    objective_i_d: str
-    objective: str
-    magnification: int
-    method_i_d: int
-    method: str
-    filter_i_d: int
-    acquisition: str
-    exposure_time: int
-    binning: int
-    color: str
-    min_level: float
-    max_level: float
+    target: str | None = None
+    objective_i_d: str | None = None
+    objective: str | None = None
+    magnification: int | None = None
+    method_i_d: int | None = None
+    method: str | None = None
+    filter_i_d: int | None = None
+    acquisition: str | None = None
+    exposure_time: int | None = None
+    binning: int | None = None
+    color: str | None = None
+    min_level: float | None = None
+    max_level: float | None = None
     c_s_u_i_d: int | None = None
     pinhole_diameter: int | None = None
     andor_parameter_i_d: int | None = None
     andor_parameter: str | None = None
-    kind: str
-    camera_type: str
-    input_level: int
-    fluorophore: str
-    light_source_name: str | list[str]
+    kind: str | None = None
+    camera_type: str | None = None
+    input_level: int | None = None
+    fluorophore: str | None = None
+    light_source_name: str | list[str] | None = None
 
 
 class ChannelList(Base):
     channel: list[Channel]
 
+    @field_validator("channel", mode="before")
+    @classmethod
+    def _ensure_list(cls, v):
+        if v is None or isinstance(v, list):
+            return v
+        if isinstance(v, dict):
+            return [v]
+        raise TypeError(f"Expected dict, list or None, got {type(v).__name__}")
+
 
 class MeasurementSetting(Base):
-    xmlns: Annotated[dict, Field(alias="xmlns")]
-    version: Literal["1.0"]
-    product_i_d: str
-    application: str
+    xmlns: Annotated[Optional[dict], Field(alias="xmlns", default=None)]
+    version: Optional[str] = None
+    product_i_d: str | None = None
+    application: str | None = None
     columns: int
     rows: int
     timelapse: Timelapse
-    light_source_list: LightSourceList
+    light_source_list: LightSourceList | None = None
     channel_list: ChannelList
 
 
@@ -356,6 +410,32 @@ class CellVoyagerAcquisition(Base):
 
     def get_image_measurement_records(self) -> list[ImageMeasurementRecord]:
         if self.measurement_data.measurement_record:
-            return [record for record in self.measurement_data.measurement_record if
-                    isinstance(record, ImageMeasurementRecord)]
+            return [
+                record
+                for record in self.measurement_data.measurement_record
+                if isinstance(record, ImageMeasurementRecord)
+            ]
         raise ValueError("No measurement records found in dataset.")
+
+    def is_tiled(self) -> bool:
+        """True if any image record carries tile indices."""
+        if not self.measurement_data.measurement_record:
+            return False
+        for r in self.measurement_data.measurement_record:
+            if isinstance(r, ImageMeasurementRecord) and r.tile_x_index is not None:
+                return True
+        return False
+
+    def get_partial_tiled_position(
+        self, timeline_index: int = 1
+    ) -> PartialTiledPosition | None:
+        """Look up the PartialTiledPosition for a given 1-based timeline index, if any."""
+        timelines = self.measurement_setting.timelapse.timeline
+        if timeline_index < 1 or timeline_index > len(timelines):
+            return None
+        return timelines[timeline_index - 1].point_sequence.partial_tiled_position
+
+    def get_tile_overlap(self, timeline_index: int = 1) -> int:
+        """Return OverlappingPixels for the given timeline, or 0 if not tiled."""
+        ptp = self.get_partial_tiled_position(timeline_index)
+        return ptp.overlapping_pixels if ptp is not None else 0
