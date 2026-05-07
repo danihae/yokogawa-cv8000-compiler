@@ -16,8 +16,13 @@ app = typer.Typer(
 def run(
     root_dir: Path = typer.Option(..., "--root-dir", help="The root directory to search for measurements."),
     out_dir: Path = typer.Option(..., "--out-dir", help="The directory where OME-TIFF files will be saved."),
-    title: str = typer.Option("compiled_data", help="The base name for the output files."),
+    title: str = typer.Option(None, help="Optional prefix for output filenames. If unset, files are named like A01_F01_L1_A1_BF3D_60x.ome.tif."),
     z_mode: str = typer.Option("maxz", help="Z-projection mode for fluorescence channels."),
+    z_mode_bf: str = typer.Option(
+        "keep",
+        "--z-mode-bf",
+        help="Z-projection mode for brightfield (BF3D) channels. One of: keep, osbm.",
+    ),
     exclude_keyword: str = typer.Option(None, "--exclude", help="Keyword to exclude measurements."),
     overwrite: bool = typer.Option(True, help="Overwrite existing output files."),
     max_workers: int = typer.Option(os.cpu_count() or 4, help="Number of parallel workers to use.")
@@ -52,6 +57,7 @@ def run(
             out_dir,
             title=title,
             z_mode=z_mode,
+            z_mode_BF=z_mode_bf,
             overwrite=overwrite,
             max_workers=max_workers,
         )

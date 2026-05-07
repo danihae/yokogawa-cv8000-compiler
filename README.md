@@ -91,6 +91,35 @@ compile-cv8000 \
 # Dry-run preview (run via Python API, see below)
 ```
 
+### Running long jobs over SSH / VS Code Remote
+
+Compilation runs can take hours. To keep the job alive after closing VS Code or disconnecting SSH, detach it from the terminal:
+
+```bash
+# fire and forget — log to out.log, print PID
+nohup uv run compile-cv8000 --root-dir /path/to/data --out-dir /path/to/output > out.log 2>&1 &
+
+# follow progress
+tail -f out.log
+
+# stop it later
+kill <PID>
+```
+
+Or use `tmux` if you want to reattach and watch live:
+
+```bash
+tmux new -s compile
+uv run compile-cv8000 --root-dir /path/to/data --out-dir /path/to/output
+# Ctrl-b then d to detach
+tmux attach -t compile   # reconnect later
+```
+
+Notes:
+- `uv run` resolves the project's virtualenv automatically — no need to activate `.venv` first.
+- Run from the project root so `uv` finds `pyproject.toml`.
+- VS Code's integrated terminal kills child processes when the window closes; `nohup` (or `tmux`) is what actually detaches them.
+
 ### Output files
 
 Each field stack is written as a single OME-TIFF:

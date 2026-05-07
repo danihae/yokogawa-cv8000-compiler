@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import tifffile
 import xarray as xr
+from scipy import ndimage as ndi
 from tqdm import tqdm
 
 from .metadata import CellVoyagerAcquisition
@@ -80,43 +81,74 @@ def _read_tif(path: Union[str, Path]):
     """
     return tifffile.imread(str(Path(path)))
 
-def osbm_projection(arr: xr.DataArray) -> xr.DataArray:
+def _tenengrad_focus(stack: np.ndarray, sigma: float = 2.0) -> np.ndarray:
+    """Per-slice Tenengrad focus measure: smoothed squared in-plane Sobel gradient.
+
+    Sobel and the optional Gaussian are applied independently to each 2D (Y, X)
+    slice — leading dims (e.g. T, C, Z) are iterated over flat. Treating the
+    operators as strictly 2D matters: applying ``ndi.sobel`` directly to a
+    higher-dim array would also smooth along non-spatial axes.
+
+    Parameters
+    ----------
+    stack : np.ndarray
+        Input array with shape (..., Y, X).
+    sigma : float, optional
+        Gaussian smoothing applied to the per-pixel focus measure.
     """
-    Performs an Out-of-focus-Suppressed Brightfield Maximum (OSBM) projection.
-    Returns an xarray.DataArray for compatibility with xarray.map_blocks.
+    s = stack.astype(np.float32, copy=False)
+    flat = s.reshape(-1, s.shape[-2], s.shape[-1])
+    out = np.empty_like(flat)
+    for i in range(flat.shape[0]):
+        gx = ndi.sobel(flat[i], axis=0)
+        gy = ndi.sobel(flat[i], axis=1)
+        m = gx * gx + gy * gy
+        if sigma > 0:
+            m = ndi.gaussian_filter(m, sigma=sigma)
+        out[i] = m
+    return out.reshape(s.shape)
+
+
+def osbm_projection(arr: xr.DataArray, sigma: float = 2.0) -> xr.DataArray:
+    """
+    Out-of-focus-Suppressed Brightfield Maximum (OSBM) projection.
+
+    For each (Y, X) pixel, computes a per-Z focus measure (Tenengrad: smoothed
+    squared in-plane Sobel gradient magnitude), normalizes it across Z to
+    obtain weights, and returns the weighted sum across Z. Pixels in
+    well-focused slices dominate while out-of-focus content is suppressed.
 
     Parameters
     ----------
     arr : xr.DataArray
-        A 5D DataArray with dimensions including 'T', 'C', 'Z', 'Y', 'X'.
+        DataArray with a 'Z' dimension and spatial 'Y', 'X' dimensions.
+    sigma : float, optional
+        Gaussian sigma used to smooth the focus measure (default 2.0).
 
     Returns
     -------
     xr.DataArray
-        A 4D DataArray of the projection with the 'Z' dimension removed.
+        DataArray with the 'Z' dimension removed, same dtype as input.
     """
-    # Get the integer position of the Z axis for numpy operations
+    in_dtype = arr.dtype
     z_axis = arr.get_axis_num('Z')
 
-    # Calculate gradient using the underlying numpy array for performance
-    gradient_np = np.abs(np.diff(
-        arr.values,
-        axis=z_axis,
-        append=np.expand_dims(arr.isel(Z=-1).values, axis=z_axis)
-    ))
+    s = arr.values.astype(np.float32, copy=False)
+    s_zlast = np.moveaxis(s, z_axis, -3)  # (..., Z, Y, X)
 
-    # Find the index of the Z-slice with the maximum gradient
-    max_gradient_idx_np = np.argmax(gradient_np, axis=z_axis)
+    focus = _tenengrad_focus(s_zlast, sigma=sigma)
+    weights = focus / (focus.sum(axis=-3, keepdims=True) + 1e-9)
+    proj = (s_zlast * weights).sum(axis=-3)  # (..., Y, X)
 
-    # Convert the numpy indices back into an xarray.DataArray with the correct dims
-    # This is crucial for xarray's advanced indexing
-    idx_da = xr.DataArray(
-        max_gradient_idx_np,
-        dims=[dim for dim in arr.dims if dim != 'Z']
-    )
+    if np.issubdtype(in_dtype, np.integer):
+        info = np.iinfo(in_dtype)
+        proj = np.clip(proj, info.min, info.max).astype(in_dtype)
+    else:
+        proj = proj.astype(in_dtype)
 
-    # Use xarray's advanced .isel() to select data. This correctly returns a DataArray.
-    return arr.isel(Z=idx_da)
+    output_dims = [dim for dim in arr.dims if dim != 'Z']
+    output_coords = {dim: arr.coords[dim] for dim in output_dims if dim in arr.coords}
+    return xr.DataArray(proj, coords=output_coords, dims=output_dims)
 
 def _entropy_projection(arr: xr.DataArray, mode: str) -> xr.DataArray:
     """Helper function for both max and min entropy projections."""
@@ -181,7 +213,7 @@ def write_fieldstack(
         df: pd.DataFrame,
         acquisition_metadata: Union[CellVoyagerAcquisition, list[CellVoyagerAcquisition]],
         out_dir: Union[Path, str],
-        title: str = "experiment",
+        title: str | None = None,
         *,
         z_mode: Literal["keep", "mip", "maxz", "osbm", "max_entropy", "min_entropy"] = "keep",
         z_mode_BF: Literal["keep", "osbm"] = "keep",
@@ -207,8 +239,8 @@ def write_fieldstack(
         Metadata for the experiment acquisitions.
     out_dir : Path or str
         Destination folder for the output file.
-    title : str, optional
-        Base name for the output file (default is "experiment").
+    title : str or None, optional
+        Optional prefix for the output filename. If None (default), no prefix is added.
     z_mode : {"keep", "mip", "maxz", "osbm", "max_entropy", "min_entropy"}, optional
         Z-projection method for fluorescence channels (default is "keep").
     z_mode_BF : {"keep", "osbm"}, optional
@@ -281,36 +313,45 @@ def write_fieldstack(
             img = correct_func(img)
         return img
 
+    # Pre-compute correction functions once per (acquisition, channel).
+    # Without this, each (timepoint, channel) iteration would re-read dark/flat
+    # TIFFs and recompute the gain, multiplying disk I/O by n_timepoints.
+    correction_funcs: dict[Tuple[int, int], object] = {}
+    if correct and "BF" not in action:
+        for begin_time, acquisition_index in zip(begin_times, acquisition_indices):
+            meta = acquisition_metadata[acquisition_index]
+            df_acq = df[df["begin_time"] == begin_time]
+            parent = os.path.dirname(str(df_acq.iloc[0]["tif_path"]))
+            for ch in np.sort(df_acq["ch"].unique()):
+                key = (int(acquisition_index), int(ch))
+                if key in correction_funcs:
+                    continue
+                camera = meta.measurement_detail.measurement_channel[ch - 1].camera_number
+                dark_path = parent + "/" + f"DC_DCAM#{camera}_CAM{camera}.tif"
+                dark = _read_tif(dark_path).astype(np.float32)
+                flat_path = parent + "/" + meta.measurement_detail.measurement_channel[
+                    ch - 1].shading_correction_source
+                flat = _read_tif(flat_path).astype(np.float32)
+                ff = flat - dark
+                gain = np.mean(ff) / ff
+                gain[np.isinf(gain)] = 0
+                correction_funcs[key] = _make_correction_func(dark, gain)
+
     # Build xarray with lazy loading using Dask delays
     data = []
     timestamps = []
     time_point_counter = 0
     for begin_time, acquisition_index in zip(begin_times, acquisition_indices):
-        meta = acquisition_metadata[acquisition_index]
         df_acq = df[df["begin_time"] == begin_time]
         time_points = np.sort(df_acq["time_point"].unique())
         channels = np.sort(df_acq["ch"].unique())
         z_indices = np.sort(df_acq["z_index"].unique())
 
-        parent = os.path.dirname(str(df_acq.iloc[0]["tif_path"]))
         for t, time_point in enumerate(time_points):
             min_time = None
             t_data = []
             for c, ch in enumerate(channels):
-                if correct and "BF" not in action:
-                    camera = meta.measurement_detail.measurement_channel[ch - 1].camera_number
-                    dark_path = parent + "/" + f"DC_DCAM#{camera}_CAM{camera}.tif"
-                    dark = _read_tif(dark_path).astype(np.float32)
-                    flat_path = parent + "/" + meta.measurement_detail.measurement_channel[
-                        ch - 1].shading_correction_source
-                    flat = _read_tif(flat_path).astype(np.float32)
-                    ff = flat - dark
-                    gain = np.mean(ff) / ff
-                    gain[np.isinf(gain)] = 0
-
-                    _correct_img = _make_correction_func(dark, gain)
-                else:
-                    _correct_img = None
+                _correct_img = correction_funcs.get((int(acquisition_index), int(ch)))
 
                 c_data = []
                 for z, z_index in enumerate(z_indices):
@@ -356,6 +397,10 @@ def write_fieldstack(
         best_z_concrete = best_z_lazy.compute()
         arr = arr.isel(Z=best_z_concrete)
     elif current_z_mode in ["osbm", "max_entropy", "min_entropy"]:
+        # Projection functions need the full Z stack per call, so collapse the
+        # Z axis into a single dask chunk before mapping.
+        arr = arr.chunk({'Z': -1})
+
         # This template correctly defines the expected output shape and dimensions
         template = arr.isel(Z=0, drop=True)
 
@@ -426,7 +471,8 @@ def write_fieldstack(
     output_directory = Path(out_dir)
     output_directory.mkdir(exist_ok=True)
     magnification = ome_metadata["Channels"][0].get('Magnification', 0)
-    fname = f"{title}_{well_id}_F{field_index:02d}_L{timeline_index}_A{action_index}_{action}_{magnification}x.ome.tif"
+    prefix = f"{title}_" if title else ""
+    fname = f"{prefix}{well_id}_F{field_index:02d}_L{timeline_index}_A{action_index}_{action}_{magnification}x.ome.tif"
     destination = output_directory / fname
 
     if destination.exists() and not overwrite:
@@ -478,7 +524,7 @@ def process_fieldstacks_parallel(
     acquisitions: List['CellVoyagerAcquisition'],
     out_dir: Union[str, Path],
     *,
-    title: str = "experiment",
+    title: str | None = None,
     z_mode: str = "maxz",
     z_mode_BF: str = "keep",
     correct: bool = True,
@@ -499,8 +545,8 @@ def process_fieldstacks_parallel(
         The list of acquisition metadata objects.
     out_dir : Path
         The destination directory for the output OME-TIFF files.
-    title : str, optional
-        The base name for the output files, by default "experiment".
+    title : str or None, optional
+        Optional prefix for the output filenames. If None (default), no prefix is added.
     z_mode : str, optional
         The Z-projection mode for fluorescence channels, by default "maxz".
     z_mode_BF : str, optional
