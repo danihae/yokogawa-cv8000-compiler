@@ -25,6 +25,13 @@ dependencies = [
     "xmltodict",
 ]
 
+[project.optional-dependencies]
+zarr = [
+    "zarr>=2.17,<3",
+    "ome-zarr>=0.9,<0.11",
+    "numcodecs>=0.12,<0.14",
+]
+
 [project.scripts]
 compile-cv8000 = "compiler.cli:app"
 

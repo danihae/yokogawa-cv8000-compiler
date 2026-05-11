@@ -32,6 +32,15 @@ def run(
             "tile grid into a single mosaic OME-TIFF (M{idx} in the filename)."
         ),
     ),
+    format: str = typer.Option(
+        "tiff",
+        "--format",
+        help=(
+            "Output format: 'tiff' (default, OME-TIFF), 'zarr' (OME-NGFF v0.4 "
+            ".ome.zarr directory), or 'both'. The 'zarr' and 'both' modes "
+            "require the [zarr] extra: uv pip install -e '.[zarr]'."
+        ),
+    ),
     no_merge_actions: str = typer.Option(
         None,
         "--no-merge-actions",
@@ -54,6 +63,7 @@ def run(
     typer.echo(f"  Source: {root_dir}")
     typer.echo(f"  Destination: {out_dir}")
     typer.echo(f"  Tile mode: {tile_mode}")
+    typer.echo(f"  Format: {format}")
 
     if tile_mode not in ("per-field", "stitch"):
         typer.secho(
@@ -61,6 +71,25 @@ def run(
             fg=typer.colors.RED,
         )
         raise typer.Exit(code=2)
+
+    if format not in ("tiff", "zarr", "both"):
+        typer.secho(
+            f"Invalid --format '{format}'. Must be 'tiff', 'zarr', or 'both'.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=2)
+
+    if format in ("zarr", "both"):
+        try:
+            import zarr  # noqa: F401
+            import ome_zarr  # noqa: F401
+        except ImportError:
+            typer.secho(
+                "OME-Zarr output requires the [zarr] extra: "
+                "uv pip install -e '.[zarr]'",
+                fg=typer.colors.RED,
+            )
+            raise typer.Exit(code=2)
 
     no_merge_list = (
         [a.strip() for a in no_merge_actions.split(",") if a.strip()]
@@ -89,6 +118,7 @@ def run(
             max_workers=max_workers,
             tile_mode=tile_mode,
             no_merge_actions=no_merge_list,
+            format=format,
         )
 
         typer.secho(f"Successfully finished compilation!", fg=typer.colors.GREEN)

@@ -19,6 +19,37 @@ from .discovery import logger
 
 
 TileMode = Literal["per-field", "stitch"]
+OutputFormat = Literal["tiff", "zarr", "both"]
+
+
+def _build_fieldstack_basename(
+    *,
+    title: str | None,
+    well_id: str,
+    group_id: int,
+    timeline_index: int,
+    action_index: int,
+    action: str,
+    magnification,
+    is_tiled_group: bool,
+    split_acq_idx,
+) -> str:
+    """Build the per-fieldstack filename stem (no extension).
+
+    Shared by the TIFF and Zarr writers — they append ``.ome.tif`` /
+    ``.ome.zarr`` respectively.
+    """
+    prefix = f"{title}_" if title else ""
+    rec_suffix = f"_R{int(split_acq_idx):02d}" if split_acq_idx is not None else ""
+    if is_tiled_group:
+        return (
+            f"{prefix}{well_id}_M{int(group_id):02d}_L{timeline_index}_A{action_index}"
+            f"_{action}_{magnification}x{rec_suffix}"
+        )
+    return (
+        f"{prefix}{well_id}_F{int(group_id):02d}_L{timeline_index}_A{action_index}"
+        f"_{action}_{magnification}x{rec_suffix}"
+    )
 
 
 def _get_well_id(row: int, column: int) -> str:
@@ -260,6 +291,43 @@ def _empirical_time_metadata(timestamps: list) -> dict:
         if median_dt > 0:
             out["FramerateHz"] = 1.0 / median_dt
     return out
+
+
+def _build_plane_metadata(
+    axes: str,
+    arr_shape: tuple,
+    relative_times: Optional[list],
+) -> list:
+    """Build OME ``<Plane>`` entries (one per ``TheT/TheC/TheZ`` combo).
+
+    OME stores per-frame acquisition time as ``DeltaT`` on ``<Plane>`` elements,
+    and that is the only place readers (e.g. tifffile / SarcAsM) look for
+    per-frame timing. ``TimeIncrement`` on ``<Pixels>`` only carries the median
+    interval; without ``<Plane>`` entries, the per-frame timestamps written
+    elsewhere never reach OME-aware tools.
+
+    Sizes are taken from the post-squeeze ``axes`` / ``arr_shape`` so they
+    match what tifffile emits as ``SizeT`` / ``SizeC`` / ``SizeZ``. Returns an
+    empty list when no timestamp could be parsed for any frame.
+    """
+    if not relative_times or all(t is None for t in relative_times):
+        return []
+
+    size_t = arr_shape[axes.index('T')] if 'T' in axes else 1
+    size_c = arr_shape[axes.index('C')] if 'C' in axes else 1
+    size_z = arr_shape[axes.index('Z')] if 'Z' in axes else 1
+
+    planes: list = []
+    for t in range(size_t):
+        dt = relative_times[t] if t < len(relative_times) else None
+        for c in range(size_c):
+            for z in range(size_z):
+                entry = {"TheT": int(t), "TheC": int(c), "TheZ": int(z)}
+                if dt is not None:
+                    entry["DeltaT"] = float(dt)
+                    entry["DeltaTUnit"] = "s"
+                planes.append(entry)
+    return planes
 
 
 def _timeline_metadata(
@@ -545,6 +613,7 @@ def write_fieldstack(
         overwrite: bool = False,
         dry_run: bool = False,
         tile_mode: TileMode = "per-field",
+        format: OutputFormat = "tiff",
 ) -> None:
     """
     Writes a 5D image stack for a single field — or a stitched mosaic of tiles —
@@ -583,6 +652,11 @@ def write_fieldstack(
         How to handle tiled acquisitions. ``"per-field"`` writes one file per
         field. ``"stitch"`` blends a tile grid (TileXIndex × TileYIndex) into a
         single mosaic per partial-tile group.
+    format : {"tiff", "zarr", "both"}, optional
+        Output format. ``"tiff"`` (default) writes the existing OME-TIFF.
+        ``"zarr"`` writes an OME-NGFF v0.4 (.ome.zarr) directory. ``"both"``
+        writes both, sharing the dask compute via ``persist()`` (peak RAM ≈ one
+        full uint16 stack — relevant for stitched mosaics).
 
     Returns
     -------
@@ -759,6 +833,14 @@ def write_fieldstack(
     ome_metadata.update(_timeline_metadata(acq_list, acquisition_indices, int(timeline_index)))
     ome_metadata.update(_empirical_time_metadata(timestamps))
 
+    plane_meta = _build_plane_metadata(
+        axes=axes,
+        arr_shape=tuple(arr.shape),
+        relative_times=ome_metadata.get("RelativeTimes"),
+    )
+    if plane_meta:
+        ome_metadata["Plane"] = plane_meta
+
     channel_setting_by_ch = {ch.ch: ch for ch in channel_list}
     for ch_num in channels_list:
         ch_meta = channel_setting_by_ch.get(int(ch_num))
@@ -780,71 +862,102 @@ def write_fieldstack(
     output_directory = Path(out_dir)
     output_directory.mkdir(exist_ok=True)
     magnification = ome_metadata["Channels"][0].get('Magnification', 0)
-    prefix = f"{title}_" if title else ""
-    rec_suffix = f"_R{int(split_acq_idx):02d}" if split_acq_idx is not None else ""
-    if is_tiled_group:
-        # Mosaic file naming uses the partial-tile index in place of field.
-        fname = (
-            f"{prefix}{well_id}_M{int(group_id):02d}_L{timeline_index}_A{action_index}"
-            f"_{action}_{magnification}x{rec_suffix}.ome.tif"
-        )
-    else:
-        fname = (
-            f"{prefix}{well_id}_F{int(group_id):02d}_L{timeline_index}_A{action_index}"
-            f"_{action}_{magnification}x{rec_suffix}.ome.tif"
-        )
-    destination = output_directory / fname
+    stem = _build_fieldstack_basename(
+        title=title,
+        well_id=well_id,
+        group_id=group_id,
+        timeline_index=timeline_index,
+        action_index=action_index,
+        action=action,
+        magnification=magnification,
+        is_tiled_group=is_tiled_group,
+        split_acq_idx=split_acq_idx,
+    )
+    tif_destination = output_directory / f"{stem}.ome.tif"
+    zarr_destination = output_directory / f"{stem}.ome.zarr"
 
-    if destination.exists() and not overwrite:
-        logger.warning("Skipping existing file: %s", destination)
+    write_tiff = format in ("tiff", "both")
+    write_zarr = format in ("zarr", "both")
+
+    if write_tiff and tif_destination.exists() and not overwrite:
+        logger.warning("Skipping existing file: %s", tif_destination)
+        write_tiff = False
+    if write_zarr and zarr_destination.exists() and not overwrite:
+        logger.warning("Skipping existing zarr: %s", zarr_destination)
+        write_zarr = False
+    if not (write_tiff or write_zarr):
         return
 
-    logger.info("Writing %s (axes=%s, shape=%s)", destination, axes, arr.shape)
+    # Share the dask compute between TIFF and Zarr writers when both are
+    # requested: persist() materializes the graph once, then both writers
+    # consume it without recomputing the source TIFFs.
+    if write_tiff and write_zarr and isinstance(arr.data, da.Array):
+        arr = arr.persist()
 
-    def clean_metadata_for_json(obj):
-        """Recursively converts NumPy types to JSON-serializable Python types."""
-        if isinstance(obj, dict):
-            return {k: clean_metadata_for_json(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [clean_metadata_for_json(item) for item in obj]
-        if isinstance(obj, np.generic):
-            return obj.item()
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return obj
+    if write_zarr:
+        from .export_zarr import write_fieldstack_zarr
 
-    clean_metadata = clean_metadata_for_json(ome_metadata)
-
-    # tifffile's OME-XML writer only emits a fixed set of standard keys; any
-    # other keys are silently dropped. Move our non-standard payload into the
-    # OME Image Description as a JSON blob so it actually gets persisted, and
-    # keep OME-standard keys (TimeIncrement etc.) at the top level so they
-    # render in the proper OME slots.
-    OME_STANDARD = {
-        "axes",
-        "PhysicalSizeX", "PhysicalSizeY", "PhysicalSizeZ",
-        "PhysicalSizeXUnit", "PhysicalSizeYUnit", "PhysicalSizeZUnit",
-        "TimeIncrement", "TimeIncrementUnit",
-        "Channels", "Plane", "Description", "Creator", "Name",
-    }
-    extras = {k: v for k, v in clean_metadata.items() if k not in OME_STANDARD}
-    write_meta = {k: v for k, v in clean_metadata.items() if k in OME_STANDARD}
-    if extras:
-        write_meta["Description"] = json.dumps(extras, default=str)
-
-    if not dry_run:
-        if isinstance(arr.data, da.Array):
-            arr_computed = arr.compute()
-            data_to_write = arr_computed.values
-        else:
-            data_to_write = arr.values
-        tifffile.imwrite(
-            destination,
-            data_to_write,
-            metadata=write_meta,
-            bigtiff=True,
-            compression=compress,
+        logger.info(
+            "Writing %s (axes=%s, shape=%s)", zarr_destination, axes, arr.shape
         )
+        write_fieldstack_zarr(
+            arr=arr,
+            axes_str=axes,
+            ome_metadata=ome_metadata,
+            destination=zarr_destination,
+            overwrite=overwrite,
+            dry_run=dry_run,
+        )
+
+    if write_tiff:
+        logger.info(
+            "Writing %s (axes=%s, shape=%s)", tif_destination, axes, arr.shape
+        )
+
+        def clean_metadata_for_json(obj):
+            """Recursively converts NumPy types to JSON-serializable Python types."""
+            if isinstance(obj, dict):
+                return {k: clean_metadata_for_json(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [clean_metadata_for_json(item) for item in obj]
+            if isinstance(obj, np.generic):
+                return obj.item()
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return obj
+
+        clean_metadata = clean_metadata_for_json(ome_metadata)
+
+        # tifffile's OME-XML writer only emits a fixed set of standard keys; any
+        # other keys are silently dropped. Move our non-standard payload into the
+        # OME Image Description as a JSON blob so it actually gets persisted, and
+        # keep OME-standard keys (TimeIncrement etc.) at the top level so they
+        # render in the proper OME slots.
+        OME_STANDARD = {
+            "axes",
+            "PhysicalSizeX", "PhysicalSizeY", "PhysicalSizeZ",
+            "PhysicalSizeXUnit", "PhysicalSizeYUnit", "PhysicalSizeZUnit",
+            "TimeIncrement", "TimeIncrementUnit",
+            "Channels", "Plane", "Description", "Creator", "Name",
+        }
+        extras = {k: v for k, v in clean_metadata.items() if k not in OME_STANDARD}
+        write_meta = {k: v for k, v in clean_metadata.items() if k in OME_STANDARD}
+        if extras:
+            write_meta["Description"] = json.dumps(extras, default=str)
+
+        if not dry_run:
+            if isinstance(arr.data, da.Array):
+                arr_computed = arr.compute()
+                data_to_write = arr_computed.values
+            else:
+                data_to_write = arr.values
+            tifffile.imwrite(
+                tif_destination,
+                data_to_write,
+                metadata=write_meta,
+                bigtiff=True,
+                compression=compress,
+            )
 
 
 def _make_fieldstack_groups(
@@ -931,6 +1044,7 @@ def process_fieldstacks_parallel(
     max_workers: int = 4,
     tile_mode: TileMode = "per-field",
     no_merge_actions: Optional[List[str]] = None,
+    format: OutputFormat = "tiff",
 ) -> None:
     """
     Process and write field stacks (or mosaics) to OME-TIFFs in parallel.
@@ -969,6 +1083,8 @@ def process_fieldstacks_parallel(
         (current behaviour). Use e.g. ``["BF", "2D"]`` to keep each rapid
         recording as its own file — files for split groups gain an
         ``_R{acquisition_index:02d}`` suffix.
+    format : {"tiff", "zarr", "both"}, optional
+        Output format. See ``write_fieldstack`` for details.
     """
 
     if isinstance(merged_records_df, pd.DataFrame):
@@ -993,6 +1109,7 @@ def process_fieldstacks_parallel(
                 correct=correct,
                 overwrite=overwrite,
                 tile_mode=tile_mode,
+                format=format,
             )
         except Exception as exc:
             logger.error("Failed to write field stack %s: %s", key, exc, exc_info=True)
