@@ -17,6 +17,8 @@ A Python tool for processing output data from Yokogawa Cell Voyager CV8000 high-
 - Compiles multi-channel, multi-timepoint, and multi-Z data into 5D image stacks
 - Multiple Z-projection modes for fluorescence and brightfield channels
 - Writes well-annotated OME-TIFF files with embedded physical pixel sizes and channel metadata
+- Optional **OME-Zarr** (OME-NGFF v0.4) output, alongside or instead of OME-TIFF
+- Desktop **GUI** (Tkinter) front-end and a static plate-map **explorer** for browsing results
 - Parallel processing via `ThreadPoolExecutor`
 
 ### Installation
@@ -34,6 +36,13 @@ pip install -e .
 
 # or with uv
 uv sync
+```
+
+OME-Zarr output is optional. To enable the `--format zarr`/`both` modes, install
+the `[zarr]` extra:
+
+```bash
+pip install -e '.[zarr]'   # or: uv sync --extra zarr
 ```
 
 ## Usage
@@ -67,6 +76,9 @@ Options:
                          multiple WPI acquisitions. Useful for rapid
                          (~20 Hz) bursts. Files for split groups gain
                          _R{idx:02d}. Default: merge everything.
+  --format TEXT          Output format: 'tiff' (OME-TIFF, default), 'zarr'
+                         (OME-NGFF v0.4 .ome.zarr), or 'both'. The zarr and
+                         both modes require the [zarr] extra (see Installation).
   --exclude TEXT         Keyword to exclude measurements whose path contains this string
   --overwrite / --no-overwrite
                          Overwrite existing output files (default: True)
@@ -191,6 +203,68 @@ compiled_data_B03_F01_L0_A1_Fluorescence_20x.ome.tif
 ```
 
 Files embed OME metadata including physical pixel sizes (µm), channel names, timestamps, operator, plate type, well ID, and Z-projection mode.
+
+### OME-Zarr output
+
+In addition to OME-TIFF, the compiler can write **OME-NGFF v0.4** (`.ome.zarr`)
+datasets via `--format`:
+
+```bash
+# OME-Zarr only
+compile-cv8000 --root-dir /data/plate --out-dir /out --format zarr
+
+# both OME-TIFF and OME-Zarr
+compile-cv8000 --root-dir /data/plate --out-dir /out --format both
+```
+
+`zarr` and `both` require the optional `[zarr]` extra (see [Installation](#installation)).
+Each dataset is a 4-level multiscale pyramid (YX decimation, dtype preserved),
+Blosc/zstd compressed. The non-standard CV8000 fields that OME-TIFF stores as a
+JSON blob in `<Description>` live here under the `cv8000` namespace in `.zattrs`,
+and per-channel display windows are written to `omero.channels`.
+
+### Desktop GUI
+
+A Tkinter front-end over the same pipeline, for users who prefer not to use the
+command line:
+
+```bash
+uv run python gui/app.py
+```
+
+It exposes the same options as the CLI — source/output folders, fluorescence and
+brightfield z-modes, tile mode, output format, no-merge actions, exclude keyword,
+worker count and overwrite — and streams the compiler log and a progress bar into
+the window while a run proceeds on a background thread.
+
+To ship it as a standalone application (no Python install needed on the target
+machine), build a one-folder bundle with PyInstaller:
+
+```bash
+bash gui/build.sh
+# → dist/cv8000_compiler/cv8000_compiler
+```
+
+![CV8000 Compiler GUI](gui/screenshot.png)
+
+### OME-Zarr explorer
+
+`experiments/build_zarr_explorer.py` generates a single-page `index.html` for an
+output directory of `.ome.zarr` datasets: an auto-detected plate map (96 / 384 /
+1536-well), a dataset list filterable by well and action, and an embedded
+[Vizarr](https://github.com/hms-dbmi/vizarr) viewer for the selected dataset.
+
+```bash
+# 1. build the page
+uv run python experiments/build_zarr_explorer.py /path/to/out_dir
+
+# 2. serve it (Vizarr fetches chunks over HTTP — file:// will not work)
+python -m http.server 8000 --directory /path/to/out_dir
+# then open http://localhost:8000/
+```
+
+If a `{stem}.analysis.html` sits next to a `{stem}.ome.zarr`, it is shown in a
+second pane under the viewer when that dataset is selected.
 
 ## Python API
 
@@ -348,6 +422,12 @@ The web GUI is available at `http://<host>:80` (via nginx) or directly at `http:
   - `metadata.py` — Pydantic models for Yokogawa XML metadata
   - `processing.py` — XML parsing and DataFrame merging
   - `export.py` — OME-TIFF writing, corrections, and Z-projection
+  - `export_zarr.py` — OME-Zarr (OME-NGFF v0.4) writer
+- **`gui/`** — Tkinter desktop front-end for the compiler
+  - `app.py` — the GUI application
+  - `build.sh` / `cv8000_compiler.spec` — PyInstaller one-folder bundle
+- **`experiments/`** — analysis and utility scripts
+  - `build_zarr_explorer.py` — static HTML explorer for OME-Zarr output
 - **`src/tiff_utils/`** — batch TIFF compression utility
   - `tiff_compression.py` — compress TIFFs from zips, directories, or loose files
 - **`experiment_manager/`** — Gradio web app for experiment registration
