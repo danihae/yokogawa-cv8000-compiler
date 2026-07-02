@@ -45,6 +45,13 @@ the `[zarr]` extra:
 pip install -e '.[zarr]'   # or: uv sync --extra zarr
 ```
 
+MP4 previews (see [MP4 previews](#mp4-previews)) need the `[video]` extra, which
+bundles a static ffmpeg — no system ffmpeg required:
+
+```bash
+pip install -e '.[video]'   # or: uv sync --extra video
+```
+
 ## Usage
 
 After installation, the `compile-cv8000` command is available on your PATH.
@@ -266,6 +273,25 @@ python -m http.server 8000 --directory /path/to/out_dir
 If a `{stem}.analysis.html` sits next to a `{stem}.ome.zarr`, it is shown in a
 second pane under the viewer when that dataset is selected.
 
+### MP4 previews
+
+`experiments/build_mp4_previews.py` turns compiled `*.ome.tif` timelapses into
+small 8-bit H.264 MP4s for quick browsing. Each frame is percentile-normalized to
+8-bit and 2× downscaled, shrinking ~1 TB of raw fluorescence timelapses to a
+~12 GiB archive (~14× smaller in practice). Requires the `[video]` extra (see
+[Installation](#installation)).
+
+```bash
+uv run python experiments/build_mp4_previews.py /path/to/out_dir
+# writes MP4s to <out_dir>/mp4/, skipping brightfield (BF) acquisitions
+```
+
+Brightfield acquisitions are skipped by default (`--exclude BF`); tune quality and
+size with `--crf`, `--scale`, and `--fps`. The run is parallel (`--workers`) and
+idempotent (existing outputs are skipped). **The MP4s are lossy viewing previews
+only** — 8-bit, downscaled, per-file contrast stretch — so keep the raw
+`.ome.tif` as the quantitative source.
+
 ## Python API
 
 The package can also be used programmatically:
@@ -428,6 +454,7 @@ The web GUI is available at `http://<host>:80` (via nginx) or directly at `http:
   - `build.sh` / `cv8000_compiler.spec` — PyInstaller one-folder bundle
 - **`experiments/`** — analysis and utility scripts
   - `build_zarr_explorer.py` — static HTML explorer for OME-Zarr output
+  - `build_mp4_previews.py` — 8-bit H.264 MP4 previews from OME-TIFF timelapses
 - **`src/tiff_utils/`** — batch TIFF compression utility
   - `tiff_compression.py` — compress TIFFs from zips, directories, or loose files
 - **`experiment_manager/`** — Gradio web app for experiment registration
