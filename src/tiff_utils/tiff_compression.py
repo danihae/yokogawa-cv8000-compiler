@@ -16,6 +16,7 @@ import logging
 import shutil
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 import zipfile
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -25,6 +26,80 @@ import tifffile
 logger = logging.getLogger(__name__)
 
 VALID_COMPRESSIONS = ("zlib", "lzw", "lzma", "zstd")
+
+# OME <Pixels>/<Plane> attributes carried over when recompressing an OME-TIFF.
+_OME_PIXELS_FLOAT = ("PhysicalSizeX", "PhysicalSizeY", "PhysicalSizeZ", "TimeIncrement")
+_OME_PIXELS_STR = (
+    "PhysicalSizeXUnit", "PhysicalSizeYUnit", "PhysicalSizeZUnit", "TimeIncrementUnit",
+)
+_OME_PLANE_INT = ("TheT", "TheC", "TheZ")
+_OME_PLANE_FLOAT = ("DeltaT", "ExposureTime", "PositionX", "PositionY", "PositionZ")
+_OME_PLANE_STR = ("DeltaTUnit", "ExposureTimeUnit")
+
+
+def _ome_rewrite_metadata(tif: tifffile.TiffFile) -> dict | None:
+    """Reconstruct an ``imwrite`` ``metadata`` dict from a source OME-TIFF.
+
+    The dimension order (``axes``) is the essential piece: without it tifffile
+    cannot tell time / z / channel apart on read-back and either mislabels the
+    stack axis (a movie silently read as channels) or leaves it unclassifiable
+    ('I'/'Q'), which OME-aware readers such as SarcAsM then reject with
+    ``Invalid axis letter(s): I``. Pixel size, per-frame ``DeltaT`` timing,
+    channel names and the compiler's custom JSON ``Description`` are carried
+    over too so the compressed copy is calibrated identically to the source.
+
+    The source OME-XML cannot simply be re-emitted verbatim (it embeds ``µm``,
+    and TIFF descriptions must be 7-bit ASCII), so tifffile is asked to
+    regenerate it from these values.
+
+    Returns ``None`` when the source is not an OME-TIFF.
+    """
+    if not (tif.is_ome and tif.ome_metadata):
+        return None
+
+    meta: dict = {"axes": tif.series[0].axes}
+    try:
+        root = ET.fromstring(tif.ome_metadata)
+        pixels = root.find(".//{*}Pixels")
+        if pixels is not None:
+            for key in _OME_PIXELS_FLOAT:
+                if (val := pixels.get(key)) is not None:
+                    meta[key] = float(val)
+            for key in _OME_PIXELS_STR:
+                if (val := pixels.get(key)) is not None:
+                    meta[key] = val
+
+            planes: list = []
+            for plane in pixels.findall("{*}Plane"):
+                entry: dict = {}
+                for key in _OME_PLANE_INT:
+                    if (val := plane.get(key)) is not None:
+                        entry[key] = int(val)
+                for key in _OME_PLANE_FLOAT:
+                    if (val := plane.get(key)) is not None:
+                        entry[key] = float(val)
+                for key in _OME_PLANE_STR:
+                    if (val := plane.get(key)) is not None:
+                        entry[key] = val
+                if entry:
+                    planes.append(entry)
+            if planes:
+                meta["Plane"] = planes
+
+            channels = [
+                {"Name": ch.get("Name", f"Channel_{i}")}
+                for i, ch in enumerate(pixels.findall("{*}Channel"))
+            ]
+            if channels:
+                meta["Channels"] = channels
+
+        description = root.findtext(".//{*}Image/{*}Description")
+        if description:
+            meta["Description"] = description
+    except Exception as exc:  # a partial parse must never lose the axes
+        logger.debug("Partial OME metadata parse: %s", exc)
+
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -39,8 +114,11 @@ def compress_tiff(
 ) -> dict:
     """Read a TIFF and rewrite it with the specified compression.
 
-    Preserves ImageJ metadata, resolution, and photometric interpretation
-    when present in the source file.
+    Preserves resolution and photometric interpretation, plus the dimension
+    metadata: ImageJ hyperstack metadata for ImageJ files, or the OME axis
+    order / pixel size / per-frame timing / channels for OME-TIFFs. Without
+    the latter a compressed movie loses its time axis (see
+    :func:`_ome_rewrite_metadata`).
 
     Parameters:
         input_path: Path to the input TIFF file.
@@ -81,10 +159,21 @@ def compress_tiff(
                 if "ResolutionUnit" in page.tags:
                     kwargs["resolutionunit"] = page.tags["ResolutionUnit"].value
 
-            # Preserve ImageJ metadata
+            # Preserve dimension metadata so the compressed copy stays a usable
+            # stack. ImageJ and OME store it differently; dropping the OME axes
+            # corrupts the file -- a movie is silently re-read as channels, or
+            # the stack axis becomes unclassifiable ('I'/'Q') and OME-aware
+            # readers reject it. ImageJ keeps its own hyperstack metadata.
             if tif.is_imagej and tif.imagej_metadata:
                 kwargs["imagej"] = True
                 kwargs["metadata"] = tif.imagej_metadata
+            else:
+                ome_meta = _ome_rewrite_metadata(tif)
+                if ome_meta is not None:
+                    # Force OME regardless of the output extension; tifffile only
+                    # auto-selects OME for a .ome.tif name.
+                    kwargs["ome"] = True
+                    kwargs["metadata"] = ome_meta
 
         tifffile.imwrite(output_path, data, compression=compression, **kwargs)
         result["success"] = True
