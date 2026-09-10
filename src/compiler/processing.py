@@ -138,6 +138,34 @@ def _filter_include_paths(
     return [p for p in paths if pattern.search(str(p))]
 
 
+def _chronological_order(begin_times: Sequence[str]) -> list[int]:
+    """Indices that sort MeasurementDetail ``BeginTime`` strings chronologically.
+
+    Parsed with :class:`pandas.Timestamp` (7-digit fractions, UTC offsets). If a
+    value does not parse, or naive and aware values are mixed, plain string order
+    is used with a warning. Duplicate BeginTimes raise: export.py selects an
+    acquisition's records with ``df["begin_time"] == bt``, so two acquisitions
+    sharing one would be merged silently.
+    """
+    begin_times = list(begin_times)
+    keys: list = begin_times
+    try:
+        parsed = [pd.Timestamp(bt) for bt in begin_times]
+        if any(pd.isna(p) for p in parsed):
+            raise ValueError("unparseable BeginTime")
+        sorted(parsed)  # TypeError when naive and aware timestamps are mixed
+        keys = parsed
+    except (ValueError, TypeError) as exc:
+        logger.warning("Cannot parse BeginTime values (%s); using string order", exc)
+    seen: dict = {}
+    for bt, key in zip(begin_times, keys):
+        seen.setdefault(key, []).append(bt)
+    dupes = [v for v in seen.values() if len(v) > 1]
+    if dupes:
+        raise ValueError(f"Duplicate BeginTime across acquisitions: {dupes}")
+    return sorted(range(len(keys)), key=keys.__getitem__)
+
+
 def parse_measurements(
     wpi_paths: Union[Path, Iterable[Path]],
     *,
@@ -162,6 +190,8 @@ def parse_measurements(
     Returns
     -------
     (pd.DataFrame, list[CellVoyagerAcquisition])
+        Acquisitions are ordered by ``MeasurementDetail.BeginTime``;
+        ``acquisition_index`` in the frame is the position in that list.
     """
     if isinstance(wpi_paths, Path):
         wpi_paths = [wpi_paths]
@@ -194,6 +224,19 @@ def parse_measurements(
     if not acquisitions:
         raise ValueError("No measurements could be parsed successfully.")
     wpi_paths = accepted_paths
+
+    # rglob order is arbitrary; number acquisitions by BeginTime so
+    # acquisition_index (and the _R suffix) is chronological
+    order = _chronological_order(
+        [acq.measurement_detail.begin_time for acq in acquisitions]
+    )
+    wpi_paths = [wpi_paths[i] for i in order]
+    acquisitions = [acquisitions[i] for i in order]
+    for idx, (path, acq) in enumerate(zip(wpi_paths, acquisitions)):
+        logger.info(
+            "acquisition_index %02d (_R%02d): %s  BeginTime=%s",
+            idx, idx, path.parent, acq.measurement_detail.begin_time,
+        )
 
     # Merge image-level tables
     merged_records: list[pd.DataFrame] = []

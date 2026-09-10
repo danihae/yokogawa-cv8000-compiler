@@ -52,6 +52,12 @@ bundles a static ffmpeg — no system ffmpeg required:
 pip install -e '.[video]'   # or: uv sync --extra video
 ```
 
+### Tests
+
+```bash
+uv run --with pytest pytest tests/ -q
+```
+
 ## Usage
 
 After installation, the `compile-cv8000` command is available on your PATH.
@@ -82,13 +88,15 @@ Options:
                          which timepoints should NOT be merged across
                          multiple WPI acquisitions. Useful for rapid
                          (~20 Hz) bursts. Files for split groups gain
-                         _R{idx:02d}. Default: merge everything.
+                         _R{idx:02d}, numbered chronologically by
+                         BeginTime (R00 = earliest). Default: merge everything.
   --format TEXT          Output format: 'tiff' (OME-TIFF, default), 'zarr'
                          (OME-NGFF v0.4 .ome.zarr), or 'both'. The zarr and
                          both modes require the [zarr] extra (see Installation).
   --exclude TEXT         Keyword to exclude measurements whose path contains this string
   --overwrite / --no-overwrite
-                         Overwrite existing output files (default: True)
+                         Overwrite existing output files (default: False;
+                         existing files are skipped)
   --max-workers INTEGER  Number of parallel workers (default: CPU count)
   --help                 Show this message and exit.
 ```
@@ -138,6 +146,11 @@ compile-cv8000 --root-dir /data/plate --out-dir /out --no-merge-actions BF,2D
 For matching actions, each `acquisition_index` gets its own OME-TIFF with an
 `_R{idx:02d}` suffix (R = "recording"), e.g. `plate_A01_F01_L1_A1_BF_60x_R02.ome.tif`.
 Other actions still merge as before.
+
+The index follows `MeasurementDetail.BeginTime`: `_R00` is the earliest acquisition,
+independent of folder names or the order in which `.wpi` files are found. The same
+number is written as `AcquisitionIndex` in the JSON description, and merged actions
+concatenate their timepoints in the same BeginTime order.
 
 ### OME metadata
 
@@ -308,7 +321,8 @@ out_dir = Path("/path/to/output")
 # 1. Find .wpi files
 wpi_paths = list(find_measurements(root_dir))
 
-# 2. Parse metadata and image records
+# 2. Parse metadata and image records. `acquisitions` is ordered by BeginTime;
+#    merged_df["acquisition_index"] is the position in that list.
 merged_df, acquisitions = parse_measurements(wpi_paths, exclude_keyword="test")
 
 # 3. Group into per-field stacks

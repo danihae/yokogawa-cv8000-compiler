@@ -1,6 +1,8 @@
-import typer
-from pathlib import Path
+import logging
 import os
+from pathlib import Path
+
+import typer
 
 from .discovery import find_measurements
 from .processing import parse_measurements
@@ -53,7 +55,10 @@ def run(
         ),
     ),
     exclude_keyword: str = typer.Option(None, "--exclude", help="Keyword to exclude measurements."),
-    overwrite: bool = typer.Option(True, help="Overwrite existing output files."),
+    overwrite: bool = typer.Option(
+        False,
+        help="Overwrite existing output files. By default existing files are skipped.",
+    ),
     max_workers: int = typer.Option(os.cpu_count() or 4, help="Number of parallel workers to use.")
 ):
     """
@@ -64,6 +69,8 @@ def run(
     typer.echo(f"  Destination: {out_dir}")
     typer.echo(f"  Tile mode: {tile_mode}")
     typer.echo(f"  Format: {format}")
+    logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger("compiler").setLevel(logging.INFO)
 
     if tile_mode not in ("per-field", "stitch"):
         typer.secho(
